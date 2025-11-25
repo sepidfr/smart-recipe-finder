@@ -1,6 +1,6 @@
 # app.py — Smart Recipe Finder (Top-3 recipes • selectable voices • conversational podcast)
 from __future__ import annotations
-import io, json, re, textwrap, asyncio
+import io, json, re, asyncio
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -10,30 +10,22 @@ import joblib
 import streamlit as st
 
 # ============================== Optional audio deps ==============================
-def _try_import_edge_tts():
+def _has_edge_tts() -> bool:
     try:
-        import edge_tts
-        return edge_tts
+        import edge_tts  # noqa: F401
+        return True
     except Exception:
-        return None
+        return False
 
-def _try_import_gtts():
+def _has_pydub() -> bool:
     try:
-        from gtts import gTTS
-        return gTTS
+        from pydub import AudioSegment  # noqa: F401
+        return True
     except Exception:
-        return None
+        return False
 
-def _try_import_pydub():
-    try:
-        from pydub import AudioSegment
-        return AudioSegment
-    except Exception:
-        return None
-
-EDGE_TTS = _try_import_edge_tts()
-gTTS     = _try_import_gtts()
-AudioSeg = _try_import_pydub()
+EDGE_OK = _has_edge_tts()
+PYDUB_OK = _has_pydub()
 
 # ============================== Paths / constants ===============================
 APP_DIR     = Path(__file__).resolve().parent
@@ -110,9 +102,7 @@ def estimate_nutrition(items: List[str], default_mass_g: float = 100.0) -> Dict[
 def predict_topk(pipe, inv_labels, ings: List[str], k: int = TOPK):
     text = " ".join(ings)
     proba = pipe.predict_proba([text])[0]
-    order = np.argsort(proba)[::-1]
-    # ensure distinct top-k classes
-    order = order[:k]
+    order = np.argsort(proba)[::-1][:k]
     names = [inv_labels[i] for i in order]
     values = proba[order]
     return names, values
@@ -171,33 +161,6 @@ def generate_recipe(cuisine: str, ings: List[str]) -> str:
     return f"{title}\n\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
 
 # ============================== Conversational podcast ==========================
-def build_podcast_dialogue(host_name: str, chef_name: str, cuisine: str, ings: List[str],
-                           nutr: Dict[str,float], tags: List[str]) -> List[Tuple[str,str]]:
-    """A natural Q&A (female host ↔ male chef) with greetings, humor, history, nutrition, and a brief method."""
-    ttags = ", ".join(tags) if tags else "balanced"
-    hcal = nutr["calorie_band"]
-    pidx = f"{nutr['protein_index']:.2f}"
-    hidx = f"{nutr['healthiness']:.2f}"
-
-    lines = [
-        ("HOST", f"Hello and welcome! I’m {host_name}, and today Chef {chef_name} is with us. Ready to cook some {cuisine.title()} magic?"),
-        ("CHEF", "Hi there! Delighted to be here—let’s turn those pantry items into something memorable."),
-        ("HOST", f"Here’s the basket: {', '.join(ings)}. What’s the game plan?"),
-        ("CHEF", "We’ll bloom aromatics gently, build flavor with the staples of this cuisine, then finish bright and fresh."),
-        ("HOST", f"Give us a quick historical nugget about {cuisine.title()} cuisine."),
-        ("CHEF", f"{cuisine.title()} cooking balances tradition and regional produce; it evolved to highlight local flavors with simple techniques that are easy to love."),
-        ("HOST", "Nutrition snapshot for our listeners?"),
-        ("CHEF", f"Calorie density is {hcal}, protein index {pidx}, healthiness {hidx}. Dietary tags: {ttags}."),
-        ("HOST", "Any chef’s tip we shouldn’t miss?"),
-        ("CHEF", "Taste at the end and balance with acid and herbs—tiny adjustments make a dish sing. And keep heat moderate to protect aromatics."),
-        ("HOST", "Perfect. Let’s cook!")
-    ]
-    return lines
-
-# ============================== TTS helpers =====================================
-# Edge-tts voices (female / male defaults + a few alternatives)
-EDGE_FEMALE_DEFAULT = "en-US-JennyNeural"
-EDGE_MALE_DEFAULT   = "en-US-GuyNeural"
 EDGE_FEMALE_CHOICES = [
     "en-US-JennyNeural",
     "en-GB-LibbyNeural",
@@ -211,60 +174,78 @@ EDGE_MALE_CHOICES = [
     "en-IN-PrabhatNeural"
 ]
 
-async def _edge_tts_bytes_async(text: str, voice: str, rate: str = "+0%", volume: str = "+0%") -> bytes:
-    tts = EDGE_TTS.Communicate(text=text, voice=voice, rate=rate, volume=volume)
-    stream = io.BytesIO()
+def _ssml_wrap_chat(text: str, rate: str = "+0%", pitch: str = "+0%") -> str:
+    safe = (text or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    return f"""<speak version="1.0" xml:lang="en-US">
+  <mstts:express-as style="chat" styledegree="2" xmlns:mstts="https://www.w3.org/2001/mstts">
+    <prosody rate="{rate}" pitch="{pitch}">{safe}</prosody>
+  </mstts:express-as>
+</speak>"""
+
+async def _edge_ssml_to_bytes_async(ssml: str, voice: str) -> bytes:
+    import edge_tts
+    tts = edge_tts.Communicate(ssml=ssml, voice=voice)
+    buf = io.BytesIO()
     async for chunk in tts.stream():
         if chunk["type"] == "audio":
-            stream.write(chunk["data"])
-    return stream.getvalue()
+            buf.write(chunk["data"])
+    return buf.getvalue()
 
-def tts_bytes_edge(text: str, voice: str) -> bytes | None:
-    if EDGE_TTS is None:
-        return None
+def tts_bytes_any(text: str, role: str, voice_name: str | None, rate: str = "+0%", pitch: str = "+0%") -> bytes | None:
+    # Preferred: Edge TTS with SSML chat style
+    if voice_name and EDGE_OK:
+        try:
+            ssml = _ssml_wrap_chat(text, rate=rate, pitch=pitch)
+            return asyncio.run(_edge_ssml_to_bytes_async(ssml, voice_name))
+        except Exception:
+            pass
+    # Fallback: gTTS (accent swap only; not truly gendered)
     try:
-        return asyncio.run(_edge_tts_bytes_async(text, voice))
-    except Exception:
-        return None
-
-def tts_bytes_gtts(text: str, role: str) -> bytes | None:
-    if gTTS is None:
-        return None
-    # Not truly gendered; use different TLDs to vary timbre slightly
-    tld = "co.uk" if role == "HOST" else "com.au"
-    try:
+        from gtts import gTTS
+        tld = "co.uk" if role == "HOST" else "com.au"
         tts = gTTS(text=text, lang="en", tld=tld)
-        buf = io.BytesIO(); tts.write_to_fp(buf)
-        return buf.getvalue()
+        out = io.BytesIO(); tts.write_to_fp(out)
+        return out.getvalue()
     except Exception:
         return None
-
-def tts_bytes(text: str, role: str, voice_name: str | None) -> bytes | None:
-    """Try Edge TTS with selected voice; fallback to gTTS accent."""
-    if voice_name and EDGE_TTS is not None:
-        b = tts_bytes_edge(text, voice_name)
-        if b: return b
-    return tts_bytes_gtts(text, role)
 
 def stitch_dialogue(dialogue: List[Tuple[str,str]], host_voice: str | None, chef_voice: str | None,
-                    pause_ms: int = 300) -> bytes | None:
-    """Return a single MP3 with alternating voices if pydub/ffmpeg available; else None."""
-    if AudioSeg is None:
+                    pause_ms: int = 300, rate: str = "+0%", pitch: str = "+0%") -> bytes | None:
+    if not PYDUB_OK:
         return None
     try:
-        track = AudioSeg.silent(duration=50)
-        gap = AudioSeg.silent(duration=max(0, int(pause_ms)))
+        from pydub import AudioSegment
+        track = AudioSegment.silent(duration=50)
+        gap   = AudioSegment.silent(duration=max(0, int(pause_ms)))
         for role, text in dialogue:
             voice = host_voice if role == "HOST" else chef_voice
-            b = tts_bytes(text, role, voice)
+            b = tts_bytes_any(text, role, voice, rate=rate, pitch=pitch)
             if not b:
                 return None
-            seg = AudioSeg.from_file(io.BytesIO(b), format="mp3")
+            seg = AudioSegment.from_file(io.BytesIO(b), format="mp3")
             track += seg + gap
         out = io.BytesIO(); track.export(out, format="mp3")
         return out.getvalue()
     except Exception:
         return None
+
+def build_podcast_dialogue(host_name: str, chef_name: str, cuisine: str, ings: List[str],
+                           nutr: Dict[str,float], tags: List[str]) -> List[Tuple[str,str]]:
+    ttags = ", ".join(tags) if tags else "balanced"
+    hcal  = nutr["calorie_band"]; pidx = f"{nutr['protein_index']:.2f}"; hidx = f"{nutr['healthiness']:.2f}"
+    return [
+        ("HOST", f"Hey everyone, I’m {host_name}. Today I’m joined by Chef {chef_name}. Ready for some {cuisine.title()} magic?"),
+        ("CHEF", "Absolutely—thanks for having me! Let’s turn simple ingredients into something memorable."),
+        ("HOST", f"Our basket: {', '.join(ings)}. What’s the plan of attack?"),
+        ("CHEF", "Warm oil, bloom aromatics low and slow, build core flavors, then finish bright with acid and herbs."),
+        ("HOST", f"What makes this feel distinctly {cuisine.title()}?"),
+        ("CHEF", f"Balanced seasoning and regional staples. It’s cozy but lively—clean flavors with a bright finish."),
+        ("HOST", "Give us a quick nutrition snapshot."),
+        ("CHEF", f"Calorie density {hcal}; protein index {pidx}; healthiness {hidx}. Tags: {ttags}."),
+        ("HOST", "Pro tip before we start?"),
+        ("CHEF", "Taste and adjust at the end—tiny acid and fresh herbs make the dish pop."),
+        ("HOST", "Perfect. Let’s cook!")
+    ]
 
 # ============================== UI =============================================
 st.set_page_config(page_title=TITLE, page_icon="🍽️", layout="wide")
@@ -273,17 +254,19 @@ st.caption("Cuisine prediction • three recipe options • calories/macros • 
 
 # Sidebar: voice & podcast controls
 st.sidebar.header("Audio Settings")
-edge_available = EDGE_TTS is not None
-st.sidebar.markdown(f"- Edge TTS available: **{'Yes' if edge_available else 'No (fallback to gTTS)'}**")
+st.sidebar.markdown(f"- Edge TTS available: **{'Yes' if EDGE_OK else 'No (fallback to gTTS)'}**")
+st.sidebar.markdown(f"- Single MP3 stitch: **{'Yes' if PYDUB_OK else 'No (install ffmpeg)'}**")
 
 host_voice = None
 chef_voice = None
-if edge_available:
+if EDGE_OK:
     host_voice = st.sidebar.selectbox("Host (female) voice", EDGE_FEMALE_CHOICES, index=0)
     chef_voice = st.sidebar.selectbox("Chef (male) voice",   EDGE_MALE_CHOICES,   index=0)
 else:
-    st.sidebar.info("Edge TTS not found: voices will fallback to gTTS accents (not truly gendered).")
+    st.sidebar.info("Edge TTS not found or blocked: using gTTS fallback (not truly gendered).")
 
+voice_rate  = st.sidebar.selectbox("Voice speed", ["-10%","-5%","+0%","+5%","+10%"], index=2)
+voice_pitch = st.sidebar.selectbox("Voice pitch", ["-2%","+0%","+2%","+4%"], index=1)
 enable_recipe_tts = st.sidebar.checkbox("Enable voice for selected recipe", value=True)
 enable_podcast    = st.sidebar.checkbox("Enable conversational podcast (Host ↔ Chef)", value=True)
 podcast_pause     = st.sidebar.slider("Pause between dialogue turns (ms)", 150, 800, 300, step=50)
@@ -310,8 +293,7 @@ with left:
     run = st.button("Predict cuisines & build 3 recipe options", type="primary", use_container_width=True)
     if run:
         if not ings:
-            st.warning("Please provide at least one ingredient.")
-            st.stop()
+            st.warning("Please provide at least one ingredient."); st.stop()
 
         # Top-3 distinct cuisines
         cuisines, probs = predict_topk(pipe, INV, ings, k=TOPK)
@@ -320,7 +302,7 @@ with left:
         st.bar_chart(df_pred.set_index("cuisine")["probability"], use_container_width=True)
 
         # Build options (one per cuisine)
-        options_meta = {}
+        options_meta: Dict[str, Dict] = {}
         for c in cuisines:
             recipe = generate_recipe(c, ings)
             macro  = estimate_nutrition(ings, default_mass_g=100.0)
@@ -330,7 +312,8 @@ with left:
 
         # Tabs to preview all three recipes
         st.markdown("### Explore three recipe options")
-        tabs = st.tabs([f"{c.title()} • {int(options_meta[c]['macro']['kcal']):d} kcal • FVS {options_meta[c]['fvs']:.2f}" for c in cuisines])
+        tab_labels = [f"{c.title()} • {int(options_meta[c]['macro']['kcal']):d} kcal • FVS {options_meta[c]['fvs']:.2f}" for c in cuisines]
+        tabs = st.tabs(tab_labels)
         for tab, c in zip(tabs, cuisines):
             with tab:
                 st.markdown(f"**Cuisine:** {c.title()}")
@@ -346,9 +329,9 @@ with left:
                            f"Protein index (0–1): {n['protein_index']:.2f} • "
                            f"Healthiness (0–1): {n['healthiness']:.2f}")
 
-        # Selection for voice/podcast target
+        # Choose which recipe to voice/podcast
         st.markdown("### Choose a recipe for voice & podcast")
-        display_labels = [f"{c.title()} • {int(options_meta[c]['macro']['kcal']):d} kcal • FVS {options_meta[c]['fvs']:.2f}" for c in cuisines]
+        display_labels = tab_labels
         label_to_cuisine = {lab: c for lab, c in zip(display_labels, cuisines)}
         selected_label = st.selectbox("Select one:", display_labels, index=0, label_visibility="collapsed")
         sel_cuisine = label_to_cuisine[selected_label]
@@ -357,32 +340,31 @@ with left:
         # Voice: single-voice read of the recipe (host voice by default)
         if enable_recipe_tts:
             st.markdown("#### 🔊 Voice recipe")
-            recipe_audio = tts_bytes(sel["recipe"], role="HOST", voice_name=host_voice)
-            if recipe_audio:
-                st.audio(recipe_audio, format="audio/mp3")
-            else:
-                st.info("TTS unavailable in this environment.")
+            audio = tts_bytes_any(sel["recipe"], role="HOST", voice_name=host_voice, rate=voice_rate, pitch=voice_pitch)
+            if audio: st.audio(audio, format="audio/mp3")
+            else:     st.info("TTS unavailable in this environment (no Edge TTS / gTTS).")
 
         # Conversational podcast: female host ↔ male chef (greetings + Q&A)
         if enable_podcast:
             st.markdown("#### 🎙️ Conversational podcast (Host ↔ Chef)")
-            dialogue = build_podcast_dialogue(host_name, chef_name, sel_cuisine, ings, sel["nutr"], dietary_tags(ings))
-            st.markdown("\n".join([f"**{r}:** {t}" for r,t in dialogue]))
+            dlg = build_podcast_dialogue(host_name, chef_name, sel_cuisine, ings, sel["nutr"], dietary_tags(ings))
+            st.markdown("\n".join([f"**{r}:** {t}" for r,t in dlg]))
 
-            combined = stitch_dialogue(dialogue, host_voice, chef_voice, pause_ms=int(podcast_pause))
-            if combined:
-                st.audio(combined, format="audio/mp3")
-            else:
-                st.caption("Fallback: playing each turn separately.")
-                for i, (role, text) in enumerate(dialogue, 1):
-                    vname = host_voice if role == "HOST" else chef_voice
-                    b = tts_bytes(text, role, vname)
-                    if b:
-                        st.markdown(f"*Turn {i} — {role}*")
-                        st.audio(b, format="audio/mp3")
-                    else:
-                        st.info("TTS unavailable in this environment.")
-                        break
+            if PYDUB_OK:
+                combined = stitch_dialogue(dlg, host_voice, chef_voice, pause_ms=int(podcast_pause),
+                                           rate=voice_rate, pitch=voice_pitch)
+                if combined: st.audio(combined, format="audio/mp3")
+                else:        st.caption("Could not stitch to one file; falling back to per-turn playback.")
+            # Per-turn playback (always works if any TTS works)
+            for i, (role, text) in enumerate(dlg, 1):
+                vname = host_voice if role == "HOST" else chef_voice
+                b = tts_bytes_any(text, role, vname, rate=voice_rate, pitch=voice_pitch)
+                if b:
+                    st.markdown(f"*Turn {i} — {role}*")
+                    st.audio(b, format="audio/mp3")
+                else:
+                    st.info("TTS unavailable in this environment.")
+                    break
 
 with right:
     st.subheader("How to use")
@@ -391,7 +373,7 @@ with right:
         "2) Click **Predict cuisines & build 3 recipe options**\n\n"
         "3) Preview three tabs (one per predicted cuisine)\n\n"
         "4) Choose a recipe for **voice** and **podcast**\n\n"
-        "5) Adjust **voices** (female host / male chef) in the sidebar"
+        "5) Pick **female host** & **male chef** voices in the sidebar"
     )
 
 st.markdown("---")
