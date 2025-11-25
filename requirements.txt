@@ -1,8 +1,9 @@
+streamlit
+scikit-learn
+joblib
+pandas
+numpy
+plotly
 edge-tts
 gTTS
 pydub
-numpy
-pandas
-joblib
-scikit-learn
-streamlit
