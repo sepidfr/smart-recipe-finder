@@ -1,4 +1,4 @@
-# app.py — Smart Recipe Finder (Top-3 recipes • selectable male/female voices • conversational podcast)
+# app.py — Smart Recipe Finder (Top-3 cuisines • 3 recipe options • pro charts • selectable voices • podcast)
 from __future__ import annotations
 import io, json, re, asyncio
 from pathlib import Path
@@ -249,7 +249,7 @@ def build_podcast_dialogue(host_name: str, chef_name: str, cuisine: str, ings: L
 # ============================== UI =============================================
 st.set_page_config(page_title=TITLE, page_icon="🍽️", layout="wide")
 st.title(TITLE)
-st.caption("Cuisine prediction • three recipe options • calories/macros • selectable male/female voices • podcast")
+st.caption("Cuisine prediction • three recipe options • calories/macros • selectable voices • conversational podcast")
 
 # Sidebar: voice & podcast controls
 st.sidebar.header("Audio Settings")
@@ -259,18 +259,18 @@ st.sidebar.markdown(f"- Single MP3 stitch: **{'Yes' if PYDUB_OK else 'No (instal
 host_voice = None
 chef_voice = None
 if EDGE_OK:
-    host_voice = st.sidebar.selectbox("Host voice (female)", EDGE_FEMALE_CHOICES, index=0)
-    chef_voice = st.sidebar.selectbox("Chef voice (male)",   EDGE_MALE_CHOICES,   index=0)
+    host_voice = st.sidebar.selectbox("Host voice (female)", EDGE_FEMALE_CHOICES, index=0, key="host_voice_sel")
+    chef_voice = st.sidebar.selectbox("Chef voice (male)",   EDGE_MALE_CHOICES,   index=0, key="chef_voice_sel")
 else:
     st.sidebar.info("Edge voices unavailable: using gTTS fallback (not truly gendered).")
 
-voice_rate      = st.sidebar.selectbox("Voice speed", ["-10%","-5%","+0%","+5%","+10%"], index=2)
-voice_pitch     = st.sidebar.selectbox("Voice pitch", ["-2%","+0%","+2%","+4%"], index=1)
-enable_recipe_tts = st.sidebar.checkbox("Enable voice for selected recipe", value=True)
-enable_podcast    = st.sidebar.checkbox("Enable conversational podcast (Host ↔ Chef)", value=True)
-podcast_pause     = st.sidebar.slider("Pause between turns (ms)", 150, 800, 300, step=50)
-host_name         = st.sidebar.text_input("Host display name", value="Sara")
-chef_name         = st.sidebar.text_input("Chef display name", value="Masoud")
+voice_rate        = st.sidebar.selectbox("Voice speed", ["-10%","-5%","+0%","+5%","+10%"], index=2, key="rate_sel")
+voice_pitch       = st.sidebar.selectbox("Voice pitch", ["-2%","+0%","+2%","+4%"], index=1, key="pitch_sel")
+enable_recipe_tts = st.sidebar.checkbox("Enable voice for selected recipe", value=True, key="rec_tts_chk")
+enable_podcast    = st.sidebar.checkbox("Enable conversational podcast (Host ↔ Chef)", value=True, key="podcast_chk")
+podcast_pause     = st.sidebar.slider("Pause between turns (ms)", 150, 800, 300, step=50, key="pause_sel")
+host_name         = st.sidebar.text_input("Host display name", value="Sara", key="host_name_in")
+chef_name         = st.sidebar.text_input("Chef display name", value="Masoud", key="chef_name_in")
 
 with st.sidebar.expander("About the model", expanded=False):
     st.markdown("- Logistic Regression over TF–IDF features\n- Trained on the Yummly ‘What’s Cooking?’ dataset")
@@ -287,11 +287,11 @@ with left:
     st.subheader("Ingredients")
     demo = "chicken, soy sauce, ginger, garlic, sesame oil"
     ing_text = st.text_area("Comma-separated or one per line", value=demo, height=120,
-                            placeholder="e.g., tomato, basil, garlic, olive oil")
+                            placeholder="e.g., tomato, basil, garlic, olive oil", key="ing_text")
     ings = parse_ingredients(ing_text)
 
     # --- Predict (one-time) ---
-    run = st.button("Predict cuisines & build 3 recipe options", type="primary", use_container_width=True)
+    run = st.button("Predict cuisines & build 3 recipe options", type="primary", use_container_width=True, key="predict_btn")
     if run:
         if not ings:
             st.warning("Please provide at least one ingredient.")
@@ -326,7 +326,7 @@ with left:
         options_meta = st.session_state["options_meta"]
         tab_labels   = st.session_state["tab_labels"]
 
-        # Top predictions — professional colored bar
+        # Top predictions — professional colored bar (unique key)
         st.markdown("### Top predictions")
         fig_pred = go.Figure(data=[
             go.Bar(
@@ -342,7 +342,7 @@ with left:
             height=300,
             template="simple_white",
         )
-        st.plotly_chart(fig_pred, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig_pred, use_container_width=True, config={"displayModeBar": False}, key="pred_chart")
 
         # Tabs to preview all three recipes
         st.markdown("### Explore three recipe options")
@@ -350,17 +350,16 @@ with left:
         for tab, c in zip(tabs, cuisines):
             with tab:
                 st.markdown(f"**Cuisine:** {c.title()}")
-                st.image(cuisine_image_url(c), use_column_width=True)
-                st.text_area("Recipe preview", value=options_meta[c]["recipe"], height=220, label_visibility="collapsed")
+                st.image(cuisine_image_url(c), use_column_width=True, key=f"img_{c}")
+                st.text_area("Recipe preview", value=options_meta[c]["recipe"], height=220,
+                             label_visibility="collapsed", key=f"recipe_preview_{c}")
 
-                # Macro chart (food chart) — professional colors
+                # Macro chart — professional colors (unique key)
                 m = options_meta[c]["macro"]
                 macro_names = ["Calories (kcal)", "Protein (g)", "Fat (g)", "Carbs (g)"]
                 macro_vals  = [m["kcal"], m["protein"], m["fat"], m["carbs"]]
                 macro_colors = ["#3E7CB1", "#66C2A5", "#FC8D62", "#8DA0CB"]
-                fig_macro = go.Figure(data=[
-                    go.Bar(x=macro_names, y=macro_vals, marker_color=macro_colors)
-                ])
+                fig_macro = go.Figure(data=[go.Bar(x=macro_names, y=macro_vals, marker_color=macro_colors)])
                 fig_macro.update_layout(
                     margin=dict(l=0, r=0, t=10, b=0),
                     yaxis=dict(title="Amount", rangemode="tozero"),
@@ -368,16 +367,14 @@ with left:
                     height=300,
                     template="simple_white",
                 )
-                st.plotly_chart(fig_macro, use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(fig_macro, use_container_width=True, config={"displayModeBar": False}, key=f"macro_{c}")
 
-                # Value chart (arzesh ghazāei) — per-cuisine, colored columns
+                # Value chart — colored columns (unique key)
                 n = options_meta[c]["nutr"]
                 value_names = ["Caloric density", "Protein index", "Healthiness", "Food Value Score"]
                 value_vals  = [n["caloric_density"], n["protein_index"], n["healthiness"], options_meta[c]["fvs"]]
                 value_colors = ["#A6CEE3", "#1F78B4", "#33A02C", "#FB9A99"]
-                fig_val = go.Figure(data=[
-                    go.Bar(x=value_names, y=value_vals, marker_color=value_colors)
-                ])
+                fig_val = go.Figure(data=[go.Bar(x=value_names, y=value_vals, marker_color=value_colors)])
                 fig_val.update_yaxes(range=[0, 1])
                 fig_val.update_layout(
                     margin=dict(l=0, r=0, t=10, b=0),
@@ -386,12 +383,12 @@ with left:
                     height=300,
                     template="simple_white",
                 )
-                st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False}, key=f"value_{c}")
 
         # Choose which recipe to voice/podcast
         st.markdown("### Choose a recipe for voice & podcast")
-        selected_label = st.selectbox("Select one:", tab_labels, index=0, label_visibility="collapsed",
-                                      key="recipe_select_label")
+        selected_label = st.selectbox("Select one:", tab_labels, index=0,
+                                      label_visibility="collapsed", key="recipe_select_label")
         sel_cuisine = dict(zip(tab_labels, cuisines))[selected_label]
         sel         = options_meta[sel_cuisine]
 
@@ -432,7 +429,7 @@ with right:
     st.markdown(
         "1) Enter ingredients\n\n"
         "2) Click **Predict cuisines & build 3 recipe options**\n\n"
-        "3) Preview tabs (each shows a recipe + colored macro chart + value chart)\n\n"
+        "3) Explore the three tabs (each has a recipe + colored macro chart + value chart)\n\n"
         "4) Choose a recipe for **voice** and **podcast**\n\n"
         "5) Pick **female host** & **male chef** voices in the sidebar"
     )
