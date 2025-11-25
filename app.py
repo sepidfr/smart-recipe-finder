@@ -1,190 +1,143 @@
-# app.py
-# Smart Recipe Finder – Streamlit App
-# - Classifies cuisine from ingredients using a pre-trained scikit-learn pipeline
-# - Shows Top-3 predictions with probabilities
-# - Fetches an illustrative food image (no API key needed)
-# - Optional TTS (gTTS) to read the result in EN/FR/DE
-
-from pathlib import Path
-import json
-import re
+import os
 import io
-import numpy as np
-import pandas as pd
+import json
+import time
 import joblib
-import streamlit as st
 import requests
+import numpy as np
+import streamlit as st
+from pathlib import Path
 from gtts import gTTS
+from deep_translator import GoogleTranslator
 
-# ---------------------------------------------------------
-# Paths (match your repo layout: files next to app.py)
-# ---------------------------------------------------------
-ROOT = Path(__file__).parent
-MODEL_PATH = ROOT / "cuisine_pipeline.joblib"
-LABELS_PATH = ROOT / "labels.json"
+APP_DIR = Path(__file__).parent
+MODEL_PATH = APP_DIR / "cuisine_pipeline.joblib"
+LABELS_PATH = APP_DIR / "labels.json"
 
-# ---------------------------------------------------------
-# Cached loaders
-# ---------------------------------------------------------
-@st.cache_resource(show_spinner="Loading model...")
+@st.cache_resource(show_spinner=False)
 def load_pipeline():
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
     pipe = joblib.load(MODEL_PATH)
+    with open(LABELS_PATH, "r", encoding="utf-8") as f:
+        labels = json.load(f)
+    inv_labels = {int(k): v for k, v in labels.items()}
+    return pipe, inv_labels
 
-    if LABELS_PATH.exists():
-        with open(LABELS_PATH, "r", encoding="utf-8") as f:
-            labels = json.load(f)
-    else:
-        # Fallback: try to infer from classifier classes_
-        try:
-            labels = list(pipe.named_steps["clf"].classes_)
-        except Exception:
-            labels = None
-    return pipe, labels
+def predict_topk(pipe, inv_labels, ingredients, k=3):
+    text = " ".join(ingredients).lower()
+    probs = pipe.predict_proba([text])[0]
+    top_idx = np.argsort(probs)[::-1][:k]
+    items = [(inv_labels[int(i)], float(probs[i])) for i in top_idx]
+    return items
 
-pipe, LABELS = load_pipeline()
+# ---------- Simple recipe generator (deterministic, no external API) ----------
+def generate_recipe(ingredients, cuisine):
+    ing = [s.strip().lower() for s in ingredients if s.strip()]
+    base_title = f"{cuisine.title()} style dish"
+    title = base_title if ing == [] else f"{cuisine.title()} {ing[0]} bowl"
+    steps = []
+    steps.append(f"Prep: wash, peel, and finely chop aromatics (if any): garlic, onion, ginger.")
+    if "rice" in " ".join(ing):
+        steps.append("Cook rice separately (1 cup rice : 1.8 cups water).")
+    steps.append(f"Marinate or season main ingredient(s): {', '.join(ing) if ing else 'selected items'} with salt, pepper, and a classic {cuisine} seasoning.")
+    steps.append("Heat oil in a pan; sauté aromatics 1–2 min until fragrant.")
+    steps.append("Add main ingredients; cook on medium-high until browned.")
+    steps.append("Adjust with acid (lemon/lime/vinegar) and herbs; simmer 3–5 min.")
+    steps.append("Taste and balance salt/sour/sweet/heat. Serve hot.")
+    return title, steps
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
-def normalize_token(s: str) -> str:
-    s = s.lower()
-    s = re.sub(r"[^a-z\s]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# ---------- Optional image retrieval (best-effort; safe fallback) -------------
+def try_image(cuisine):
+    try:
+        qry = f"{cuisine} cuisine dish"
+        url = f"https://source.unsplash.com/800x600/?{requests.utils.quote(qry)}"
+        # Unsplash random endpoint always returns an image; Streamlit will fetch it.
+        return url
+    except Exception:
+        return None
 
-def ingredients_to_text(raw: str) -> str:
-    """
-    Accepts comma- or newline-separated ingredients from the textarea
-    and converts to a single normalized string.
-    """
-    # split on comma or newline
-    parts = re.split(r"[,\n]+", raw)
-    parts = [normalize_token(p) for p in parts if p.strip()]
-    return " ".join(parts)
+# ---------- Text-to-speech helpers -------------------------------------------
+LANG_MAP = {"English": "en", "Français": "fr", "Deutsch": "de"}
 
-def topk_prob(proba: np.ndarray, classes, k=3):
-    idx = np.argsort(proba)[::-1][:k]
-    return [(classes[i], float(proba[i])) for i in idx]
+def maybe_translate(text, tgt_lang_code):
+    # If English requested, keep as-is; otherwise translate via GoogleTranslator
+    if tgt_lang_code == "en":
+        return text
+    try:
+        return GoogleTranslator(source="auto", target=tgt_lang_code).translate(text)
+    except Exception:
+        # Fallback: return original
+        return text
 
-def cuisine_image_url(cuisine: str) -> str:
-    """
-    Keyless illustrative image via Unsplash source.
-    """
-    q = requests.utils.quote(f"{cuisine} cuisine food")
-    return f"https://source.unsplash.com/800x600/?{q}"
-
-def tts_bytes(text: str, lang_code: str = "en") -> bytes:
-    """
-    Generate MP3 bytes via gTTS (works on Streamlit Cloud).
-    """
-    tts = gTTS(text=text, lang=lang_code)
+def speak(text, lang_code="en", rate=1.0):
+    # gTTS doesn’t support rate directly; emulate by duplicating spaces for slower feel
+    txt = text if rate >= 1.0 else (" ".join(text.split()))
+    tts = gTTS(txt, lang=lang_code)
     buf = io.BytesIO()
     tts.write_to_fp(buf)
     buf.seek(0)
-    return buf.read()
+    return buf
 
-def example_dish(cuisine: str) -> str:
-    """
-    Minimal stub for a dish name per cuisine (no external dependency).
-    """
-    table = {
-        "italian": "Spaghetti al Pomodoro",
-        "mexican": "Tacos al Pastor",
-        "indian": "Chicken Tikka Masala",
-        "chinese": "Kung Pao Chicken",
-        "japanese": "Chicken Teriyaki",
-        "korean": "Bibimbap",
-        "thai": "Pad Thai",
-        "french": "Coq au Vin",
-        "greek": "Greek Salad",
-        "spanish": "Paella",
-        "vietnamese": "Pho",
-        "moroccan": "Chicken Tagine",
-        "russian": "Borscht",
-        "brazilian": "Feijoada",
-        "british": "Fish and Chips",
-        "cajun_creole": "Jambalaya",
-        "filipino": "Adobo",
-        "irish": "Beef Stew",
-        "jamaican": "Jerk Chicken",
-        "southern_us": "Fried Chicken",
-    }
-    return table.get(cuisine, f"{cuisine.title()} dish")
-
-LANG2CODE = {"English": "en", "Français": "fr", "Deutsch": "de"}
-
-# ---------------------------------------------------------
-# UI
-# ---------------------------------------------------------
-st.set_page_config(page_title="Smart Recipe Finder", page_icon="🍽️", layout="centered")
-st.title("🍽️ Smart Recipe Finder")
-st.caption("Classify cuisine from ingredients • Show top-3 • Image • Optional TTS")
+# ============================== UI ===========================================
+st.set_page_config(page_title="Smart Recipe Finder", page_icon="🍳", layout="wide")
+st.title("🍳 Smart Recipe Finder")
+st.caption("TF-IDF + Logistic Regression | Multilingual voice & basic recipe generation")
 
 with st.sidebar:
     st.header("Settings")
-    lang_label = st.selectbox("Voice language (TTS)", list(LANG2CODE.keys()), index=0)
+    voice_lang = st.selectbox("Voice language (TTS)", list(LANG_MAP.keys()), index=0)
     do_tts = st.checkbox("Generate voice (TTS)", value=False)
+    do_translate = st.checkbox("Translate recipe text to voice language", value=True)
+    rate = st.slider("Reading speed (approx.)", min_value=0.6, max_value=1.4, value=1.0, step=0.05)
     st.markdown("---")
-    st.write("**About the model**")
-    st.write("- TF-IDF + LogisticRegression (multiclass)")
-    if LABELS is not None:
-        st.write(f"- Classes: {len(LABELS)}")
+    st.subheader("About the model")
+    st.markdown("- TF-IDF + LogisticRegression (multiclass)\n- Classes: 20")
 
-st.subheader("Enter ingredients")
-example = "chicken, soy sauce, ginger, garlic, sesame oil"
-raw_ing = st.text_area("Comma or newline separated", value=example, height=120)
+pipe, INV_LABELS = load_pipeline()
 
-if st.button("Predict cuisine", type="primary"):
-    if not raw_ing.strip():
+with st.expander("Enter ingredients", expanded=True):
+    ing_text = st.text_area(
+        "List ingredients (comma-separated)",
+        value="chicken, soy sauce, ginger, garlic, sesame oil",
+        height=100,
+        help="Example: tomato, basil, mozzarella, olive oil",
+    )
+    ingredients = [s.strip() for s in ing_text.split(",") if s.strip()]
+    k = st.slider("Top-k cuisines", 1, 5, 3)
+
+if st.button("Predict"):
+    if not ingredients:
         st.warning("Please enter at least one ingredient.")
         st.stop()
 
-    text = ingredients_to_text(raw_ing)
-    try:
-        proba = pipe.predict_proba([text])[0]
-        classes = getattr(pipe.named_steps["clf"], "classes_", LABELS)
-        if classes is None:
-            st.error("Could not determine class labels.")
-            st.stop()
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
-        st.stop()
+    # Predictions
+    topk = predict_topk(pipe, INV_LABELS, ingredients, k=k)
+    top1_cuisine, top1_prob = topk[0]
 
-    # Top-3 table
-    top3 = topk_prob(proba, classes, k=3)
-    df_top = pd.DataFrame(
-        [{"cuisine": c, "probability": p} for c, p in top3]
-    ).assign(probability=lambda d: d["probability"].round(4))
-    st.subheader("Predicted cuisines (Top-3)")
-    st.dataframe(df_top, use_container_width=True, hide_index=True)
+    # Display bar chart
+    st.subheader("Predicted cuisines (Top-k)")
+    probs_df = {"cuisine": [c for c, _ in topk], "prob": [p for _, p in topk]}
+    st.bar_chart(probs_df, x="cuisine", y="prob", use_container_width=True)
 
-    # Bar chart
-    st.bar_chart(df_top.set_index("cuisine"))
+    # Image (safe)
+    img_url = try_image(str(top1_cuisine))
+    st.subheader(f"Image • {str(top1_cuisine).title()}")
+    if img_url:
+        st.image(img_url, use_column_width=True, caption=f"{str(top1_cuisine).title()} (illustrative)")
+    else:
+        st.info("No image available.")
 
-    # Representative image for top-1
-    top1_cuisine, top1_p = top3[0]
-    st.subheader(f"Image • {top1_cuisine.title()}")
-    st.image(cuisine_image_url(top1_cuisine), caption=f"{top1_cuisine.title()} (illustrative)")
+    # Recipe generation
+    title, steps = generate_recipe(ingredients, str(top1_cuisine))
+    st.markdown(f"### 🍽️ {title}")
+    recipe_text = f"{title}\n\n" + "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps)])
 
-    # Example dish
-    dish = example_dish(top1_cuisine)
-    st.markdown(f"**Example dish:** {dish}")
+    # Optional translation of visible text
+    view_lang_code = LANG_MAP[voice_lang] if do_translate else "en"
+    recipe_text_view = maybe_translate(recipe_text, view_lang_code) if do_translate else recipe_text
+    st.text_area("Recipe", value=recipe_text_view, height=220)
 
-    # Optional TTS
+    # Voice
     if do_tts:
-        lang_code = LANG2CODE[lang_label]
-        speak_text = (
-            f"Predicted cuisine: {top1_cuisine}. Example dish: {dish}. "
-            f"Top three probabilities: " +
-            ", ".join([f"{c}: {p:.2f}" for c, p in top3]) + "."
-        )
-        try:
-            audio_bytes = tts_bytes(speak_text, lang_code=lang_code)
-            st.audio(audio_bytes, format="audio/mp3")
-        except Exception as e:
-            st.warning(f"TTS failed: {e}")
-
-st.markdown("---")
-st.caption("© Smart Recipe Finder – TF-IDF + LogisticRegression pipeline")
+        tts_lang = LANG_MAP[voice_lang]
+        audio_buf = speak(recipe_text_view, lang_code=tts_lang, rate=rate)
+        st.audio(audio_buf, format="audio/mp3")
