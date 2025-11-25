@@ -1,245 +1,295 @@
-import json, io, os, re, math, textwrap, requests
+# app.py
+# ============================================================
+# Recipe Finder • Cuisine Classification + Recipe Generator
+# TF–IDF + Logistic Regression (pipeline saved as joblib)
+# Streamlit UI with: chart, image, recipe text, nutrition tags,
+# and optional English TTS (gTTS) including a "podcast mode".
+# ============================================================
+
+from __future__ import annotations
+import io
+import json
+import textwrap
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
-import altair as alt
-import streamlit as st
 import joblib
-from gtts import gTTS
-from pydub import AudioSegment
+import streamlit as st
 
-# -----------------------------
-# Paths
-# -----------------------------
-MODEL_PATH = "cuisine_pipeline.joblib"
-LABELS_PATH = "labels.json"
+from gtts import gTTS  # simple, no-API text-to-speech
 
-# -----------------------------
-# Cache: load pipeline + labels
-# -----------------------------
-@st.cache_resource(show_spinner="Loading model...")
-def load_pipeline():
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Missing {MODEL_PATH} in app root.")
-    if not os.path.exists(LABELS_PATH):
-        raise FileNotFoundError(f"Missing {LABELS_PATH} in app root.")
+# ---------- Paths ----------
+APP_DIR = Path(__file__).resolve().parent
+MODEL_PATH = APP_DIR / "cuisine_pipeline.joblib"
+LABELS_PATH = APP_DIR / "labels.json"
+
+# ---------- Constants ----------
+TITLE = "Smart Recipe Finder"
+TOPK = 3  # show top-k cuisines
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+# ---------- Cache loaders ----------
+@st.cache_resource(show_spinner="Loading model pipeline...")
+def load_pipeline() -> Tuple[object, Dict[int, str]]:
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Model not found at {MODEL_PATH}. Upload cuisine_pipeline.joblib to the app root."
+        )
     pipe = joblib.load(MODEL_PATH)
+
+    if not LABELS_PATH.exists():
+        raise FileNotFoundError(
+            f"Labels file not found at {LABELS_PATH}. Upload labels.json (int->str mapping)."
+        )
+
     with open(LABELS_PATH, "r", encoding="utf-8") as f:
         labels = json.load(f)
+
+    # Ensure keys are ints
     inv = {int(k): v for k, v in labels.items()}
     return pipe, inv
 
-PIPE, INV = load_pipeline()
-CLASSES = [INV[i] for i in sorted(INV)]
 
-# -----------------------------
-# Cleaning: same as training
-# -----------------------------
-def normalize_ingredient(s: str) -> str:
-    s = s.lower()
-    s = re.sub(r"[^a-z\s]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# ---------- Simple helpers ----------
+def cuisine_image_url(cuisine_name: str) -> str:
+    """
+    No external API: use Unsplash's source endpoint to fetch a representative, license-friendly photo.
+    This URL can be passed directly to st.image and loads on the client.
+    """
+    query = f"{cuisine_name} dish plated"
+    return f"https://source.unsplash.com/800x500/?{query.replace(' ', '%20')}"
 
-def join_ingredients(ings):
-    return " ".join(normalize_ingredient(x) for x in ings)
 
-# -----------------------------
-# Wikipedia image fetch (safe)
-# -----------------------------
-WIKI_API = "https://en.wikipedia.org/w/api.php"
+def pretty_ingredients_box(text: str) -> List[str]:
+    # Split by comma or newline; strip/normalize
+    raw = [t.strip() for t in text.replace("\n", ",").split(",")]
+    return [t for t in raw if t]
 
-@st.cache_data(show_spinner=False)
-def fetch_wikipedia_image(cuisine: str) -> str | None:
-    """Return main image URL for a cuisine page, else None."""
-    try:
-        # Search page
-        params = dict(
-            action="query", format="json", list="search",
-            srsearch=f"{cuisine} cuisine", srlimit=1
-        )
-        r = requests.get(WIKI_API, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if not data["query"]["search"]:
-            return None
-        title = data["query"]["search"][0]["title"]
-        # Pageimage
-        params2 = dict(
-            action="query", format="json", prop="pageimages",
-            piprop="original", titles=title
-        )
-        r2 = requests.get(WIKI_API, params=params2, timeout=10)
-        r2.raise_for_status()
-        pages = r2.json()["query"]["pages"]
-        for _, pg in pages.items():
-            if "original" in pg and "source" in pg["original"]:
-                return pg["original"]["source"]
-        return None
-    except Exception:
-        return None
 
-# -----------------------------
-# Simple rule-based nutrition
-# -----------------------------
-CAL_DB = {
-    # kcal per common unit ~1 item or 100g rough averages
-    "chicken": 165, "beef": 250, "pork": 242, "lamb": 258, "shrimp": 99, "fish": 206,
-    "egg": 78, "milk": 60, "butter": 717, "cream": 340, "yogurt": 59, "cheese": 402,
-    "rice": 130, "noodle": 138, "pasta": 131, "bread": 265, "flour": 364, "tortilla": 237,
-    "potato": 77, "tomato": 18, "onion": 40, "garlic": 149, "pepper": 26, "ginger": 80,
-    "oil": 884, "olive": 884, "sesame oil": 884, "ghee": 900,
-    "sugar": 387, "honey": 304, "soy sauce": 60, "coconut milk": 230,
-    "beans": 347, "lentil": 116, "chickpea": 164, "tofu": 76, "mushroom": 22,
-    "spinach": 23, "carrot": 41, "cabbage": 25, "broccoli": 34, "eggplant": 25
-}
+def predict_topk(pipe, inv_labels: Dict[int, str], ingredients: List[str], k: int = TOPK):
+    text = " ".join(ingredients)
+    probs = pipe.predict_proba([text])[0]
+    order = np.argsort(probs)[::-1][:k]
+    names = [inv_labels[i] for i in order]
+    values = probs[order]
+    return names, values, probs
 
-GLUTEN_KEYS = {"wheat", "barley", "rye", "farina", "semolina", "bulgur", "bread", "flour", "pasta", "noodle", "couscous"}
-NON_HALAL = {"pork", "bacon", "ham", "lard", "gelatin (porcine)", "wine", "beer", "rum", "brandy", "sake"}
-ANIMAL_MEAT = {"chicken", "beef", "pork", "lamb", "goat", "turkey", "duck", "fish", "shrimp", "crab", "clam", "oyster"}
-DAIRY = {"milk", "butter", "cream", "cheese", "yogurt", "ghee"}
 
-def estimate_calories(ings: list[str], servings: int = 4) -> dict:
-    tokens = [normalize_ingredient(x) for x in ings]
-    total = 0.0
-    for t in tokens:
-        # pick best matching key in DB
-        best = None
-        for k in CAL_DB:
-            if k in t:
-                best = k; break
-        if best is not None:
-            total += CAL_DB[best]
-        else:
-            # default small add for spices/unknowns
-            total += 15
-    per_serv = max(total / max(servings,1), 1.0)
-    # crude health flag
-    oilish = any(x in " ".join(tokens) for x in ["oil", "butter", "ghee", "cream"])
-    health_note = "lighter" if per_serv < 500 and not oilish else "rich"
-    return {"total_kcal": int(round(total)), "per_serv_kcal": int(round(per_serv)), "note": health_note}
+def qualitative_nutrition(ings: List[str]) -> Dict[str, float]:
+    """
+    Lightweight nutrition estimate: score [0..1] proxies for caloric density, protein, and 'healthiness'.
+    Heuristic: fats/sugars ↑ calories; lean proteins ↑ protein; greens/herbs ↑ healthiness.
+    """
+    s = " ".join(ings).lower()
 
-def diet_tags(ings: list[str]) -> list[str]:
-    txt = " " + " | ".join(normalize_ingredient(x) for x in ings) + " "
-    has_meat = any((" " + m + " ") in txt for m in ANIMAL_MEAT)
-    has_dairy = any((" " + d + " ") in txt for d in DAIRY)
-    has_non_halal = any((" " + h + " ") in txt for h in NON_HALAL)
-    has_gluten = any(g in txt for g in GLUTEN_KEYS)
+    hi_cal = sum(w in s for w in ["butter", "oil", "olive oil", "ghee", "cream", "cheese", "sugar", "fried", "bacon", "nuts", "peanut"])
+    protein = sum(w in s for w in ["chicken", "beef", "pork", "fish", "tuna", "egg", "tofu", "lentil", "bean", "chickpea", "yogurt", "paneer"])
+    greens = sum(w in s for w in ["spinach", "kale", "broccoli", "herb", "parsley", "cilantro", "tomato", "cucumber", "lettuce", "carrot", "zucchini", "pepper"])
 
+    # Normalize to [0,1]
+    c_score = min(1.0, 0.20 * hi_cal + 0.15 * len(ings))
+    p_score = min(1.0, 0.12 * protein + 0.02 * len(ings))
+    h_score = min(1.0, 0.10 * greens + 0.02 * (len(ings) - hi_cal))
+
+    # "Calories per serving" rough category
+    cal_cat = "low"
+    if c_score > 0.66:
+        cal_cat = "high"
+    elif c_score > 0.33:
+        cal_cat = "medium"
+
+    return {
+        "caloric_density": float(c_score),
+        "protein_index": float(p_score),
+        "healthiness": float(h_score),
+        "calorie_band": cal_cat,
+    }
+
+
+def dietary_tags(ings: List[str]) -> List[str]:
+    s = " ".join(ings).lower()
     tags = []
-    if not has_meat and not has_dairy:
-        tags.append("vegan")
-    elif not has_meat and has_dairy:
-        tags.append("vegetarian")
-    if not has_non_halal and "pork" not in txt and "bacon" not in txt and "ham" not in txt:
-        tags.append("halal-friendly")
-    if not has_gluten:
-        tags.append("gluten-free")
-    return tags or ["general"]
+    # Vegan/Vegetarian (very rough)
+    animal = any(w in s for w in ["chicken", "beef", "pork", "fish", "shrimp", "egg", "yogurt", "cheese", "milk", "butter", "honey"])
+    dairy = any(w in s for w in ["cheese", "milk", "yogurt", "cream", "butter", "ghee"])
+    gluten = any(w in s for w in ["flour", "bread", "pasta", "noodle", "wheat", "semolina", "bulgur", "couscous"])
+    pork = "pork" in s or "bacon" in s or "ham" in s
+    alcohol = any(w in s for w in ["wine", "beer", "ale", "vodka", "rum", "whiskey", "brandy"])
 
-# -----------------------------
-# Natural-sounding recipe text
-# -----------------------------
-def generate_recipe_text(cuisine: str, ings: list[str]) -> str:
-    base = ", ".join(ings[:6]) + ("..." if len(ings) > 6 else "")
-    lines = [
-        f"This is a {cuisine.replace('_',' ')} style dish built around {base}.",
-        "Warm a wide pan over medium heat. Add a touch of oil and let the aromatics release their fragrance.",
-        "Stir in the main ingredients and season gradually with salt, pepper, and the spices typical of this cuisine.",
-        "Cook until tender but lively in texture, adding a splash of water or stock if the pan dries.",
-        "Finish with fresh herbs, a squeeze of citrus, or a drizzle of sauce; taste and balance salt and acidity.",
-        "Serve immediately while hot."
+    if not animal and not dairy:
+        tags.append("vegan-ish")
+    elif not animal:
+        tags.append("vegetarian-ish")
+
+    if not gluten:
+        tags.append("gluten-light")
+    if not pork:
+        tags.append("pork-free")
+    if not alcohol:
+        tags.append("no-alcohol")
+
+    # Spiciness signal
+    if any(w in s for w in ["chili", "chilli", "jalapeno", "cayenne", "gochujang", "harissa", "pepper flakes"]):
+        tags.append("spicy")
+
+    return tags[:4]  # keep it compact
+
+
+def generate_recipe(cuisine: str, ings: List[str]) -> str:
+    """
+    Structured, readable steps with numbered list.
+    """
+    title = f"{cuisine.title()} Style Dish with {', '.join(ings[:3]).title() if ings else 'Seasonal Ingredients'}"
+    steps = [
+        "Prep: finely chop aromatics (garlic/ginger/onion) and measure spices.",
+        "Season main ingredients with salt and pepper.",
+        "Heat oil in a pan; bloom spices and aromatics until fragrant.",
+        "Add main ingredients, sear lightly, then cook through.",
+        "Adjust with acid (lemon/lime/vinegar) and fresh herbs.",
+        "Taste, correct seasoning, and serve warm."
     ]
-    return "\n\n".join(lines)
 
-# -----------------------------
-# TTS (English only here)
-# -----------------------------
-@st.cache_data(show_spinner=False)
-def tts_bytes(text: str, lang="en", speed=1.0) -> bytes:
-    tts = gTTS(text=text, lang=lang)
+    # Cuisine-specific flourish
+    flair = {
+        "indian": "Finish with garam masala and fresh cilantro.",
+        "chinese": "Balance with a 1–1 soy sauce and rice vinegar splash; add sesame oil off-heat.",
+        "italian": "Deglaze with a touch of white wine; finish with olive oil and basil.",
+        "mexican": "Add cumin and chili powder; finish with lime and cilantro.",
+        "japanese": "Season with a dash of mirin and soy; garnish with scallion.",
+        "korean": "Stir in gochujang for heat and depth; top with sesame seeds.",
+        "french": "Mount with a small knob of butter; add parsley and chives.",
+        "thai": "Balance sweet–sour–salty with palm sugar, lime, and fish sauce."
+    }
+    steps.append(flair.get(cuisine.lower(), "Finish with fresh herbs and a drizzle of good olive oil."))
+
+    block = f"{title}\n\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+    return block
+
+
+def tts_bytes_en(text: str) -> bytes:
+    """
+    English TTS to MP3 bytes (gTTS). Single-voice for reliability on Streamlit Cloud.
+    """
+    tts = gTTS(text=text, lang="en")
     buf = io.BytesIO()
     tts.write_to_fp(buf)
-    buf.seek(0)
-    audio = AudioSegment.from_file(buf, format="mp3")
-    if abs(speed - 1.0) > 1e-3:
-        audio = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate*speed)}).set_frame_rate(audio.frame_rate)
-    out = io.BytesIO()
-    audio.export(out, format="mp3")
-    return out.getvalue()
+    return buf.getvalue()
 
-# -----------------------------
-# UI
-# -----------------------------
-st.set_page_config(page_title="Smart Recipe Finder", layout="wide")
 
+def build_podcast_script(cuisine: str, ings: List[str], nutr: Dict[str, float], tags: List[str]) -> str:
+    """
+    Single-voice 'interview style' script (HOST / CHEF cues kept in text).
+    """
+    ttags = ", ".join(tags) if tags else "balanced"
+    return textwrap.dedent(f"""
+    HOST: Welcome to Quick Plates! Today we're exploring {cuisine.title()} cuisine.
+    HOST: Our basket ingredients are: {', '.join(ings)}.
+
+    CHEF: Great pick! This style often balances tradition with bold flavors.
+    CHEF: For a quick home version, sauté aromatics, add your main ingredient, and finish with regional staples.
+
+    HOST: Nutrition snapshot?
+    CHEF: Caloric density looks {nutr['calorie_band']}, protein index {nutr['protein_index']:.2f}, overall healthiness {nutr['healthiness']:.2f}.
+    CHEF: Dietary hints: {ttags}.
+
+    HOST: Any final flourish?
+    CHEF: Always taste and balance at the end. Fresh herbs and acid bring the dish alive.
+
+    HOST: Thanks for cooking with us!""").strip()
+
+
+# ------------------------ UI ------------------------
+st.set_page_config(page_title=TITLE, page_icon="🍽️", layout="wide")
+st.title(TITLE)
+st.caption("TF–IDF + Logistic Regression • Multiclass cuisine classifier + recipe generator")
+
+# Sidebar controls
 st.sidebar.header("Settings")
-enable_tts = st.sidebar.checkbox("Enable Voice (English TTS)", value=True)
-st.sidebar.markdown("**Model:** Logistic Regression + TF-IDF\n\n**Classes:** " + str(len(CLASSES)))
+enable_tts = st.sidebar.checkbox("Enable voice (English TTS)", value=False)
+enable_podcast = st.sidebar.checkbox("Podcast mode (single-voice)", value=False)
 
-st.title("Smart Recipe Finder")
-st.caption("Enter ingredients, get predicted cuisine, recipe text, image, calories, and diet tags.")
+with st.sidebar.expander("About the model", expanded=True):
+    st.markdown("- Logistic Regression + TF-IDF (multiclass)")
+pipe, INV = load_pipeline()
+st.sidebar.markdown(f"- Classes: {len(INV)}")
 
-# Input
-ings_input = st.text_area(
-    "Ingredients (comma-separated)",
-    value="chicken, soy sauce, ginger, garlic, sesame oil",
-    help="e.g., tomato, basil, olive oil"
-)
-servings = st.number_input("Servings (for calorie estimate)", min_value=1, max_value=12, value=4, step=1)
-btn = st.button("Predict & Generate", type="primary")
+# Input area
+col_left, col_right = st.columns([1.2, 1.0], vertical_alignment="top")
 
-# Output
-if btn:
-    ings = [x.strip() for x in ings_input.split(",") if x.strip()]
-    if not ings:
-        st.warning("Please enter at least one ingredient.")
-        st.stop()
-
-    text_for_model = join_ingredients(ings)
-    proba = PIPE.predict_proba([text_for_model])[0]
-    order = np.argsort(proba)[::-1]
-    top1_idx, top1_p = int(order[0]), float(proba[order[0]])
-    top3 = [(INV[int(i)], float(proba[i])) for i in order[:3]]
-    top1_cuisine = INV[top1_idx]
-
-    # ---- chart (clean labels) ----
-    df_top3 = pd.DataFrame({"Cuisine": [c for c,_ in top3], "Probability": [p for _,p in top3]})
-    chart = (
-        alt.Chart(df_top3)
-        .mark_bar()
-        .encode(
-            x=alt.X("Cuisine", sort="-y"),
-            y=alt.Y("Probability", scale=alt.Scale(domain=[0,1])),
-            tooltip=["Cuisine", alt.Tooltip("Probability", format=".2f")]
-        )
-        .properties(height=260)
+with col_left:
+    st.subheader("Ingredients")
+    default_demo = "chicken, soy sauce, ginger, garlic, sesame oil"
+    ing_text = st.text_area(
+        "Comma-separated or one per line",
+        value=default_demo,
+        height=120,
+        placeholder="e.g., tomato, basil, garlic, olive oil",
     )
-    st.altair_chart(chart, use_container_width=True)
+    ings = pretty_ingredients_box(ing_text)
 
-    st.subheader(f"Image • {top1_cuisine.replace('_',' ').title()}")
-    img_url = fetch_wikipedia_image(top1_cuisine)
-    if img_url:
-        st.image(img_url, use_column_width=True)
-    else:
-        st.info("No image found on Wikipedia; showing text only.")
+    if st.button("Find cuisine & build recipe", type="primary", use_container_width=True):
+        if not ings:
+            st.warning("Please provide at least one ingredient.")
+        else:
+            # Predict top-k + probabilities
+            names, values, all_probs = predict_topk(pipe, INV, ings, k=TOPK)
 
-    # Recipe text (natural)
-    st.subheader(f"🧑‍🍳 {top1_cuisine.replace('_',' ').title()} Inspired Recipe")
-    recipe_text = generate_recipe_text(top1_cuisine, ings)
-    st.text_area("Generated Recipe", recipe_text, height=220)
+            # Chart
+            st.subheader("Top predictions")
+            df_plot = pd.DataFrame({"cuisine": names, "probability": values})
+            st.bar_chart(df_plot, x="cuisine", y="probability", use_container_width=True)
 
-    # Calories + diet tags
-    colA, colB = st.columns([1,1])
-    with colA:
-        est = estimate_calories(ings, servings=servings)
-        st.metric("Estimated kcal (total)", est["total_kcal"])
-        st.metric("Estimated kcal / serving", est["per_serv_kcal"])
-        st.caption(f"Profile: **{est['note']}** (very rough, heuristic).")
-    with colB:
-        tags = diet_tags(ings)
-        st.markdown("**Diet tags:** " + " • ".join(f"`{t}`" for t in tags))
+            # Top-1 block
+            top1 = names[0]
+            img_url = cuisine_image_url(top1)
+            st.markdown(f"### Image • {top1.title()}")
+            st.image(img_url, use_column_width=True)
 
-    # Optional voice
-    if enable_tts:
-        audio_bytes = tts_bytes(recipe_text, lang="en", speed=1.0)
-        st.audio(audio_bytes, format="audio/mp3")
+            # Recipe text
+            st.markdown("### 🧾 Generated Recipe")
+            recipe_text = generate_recipe(top1, ings)
+            st.text_area("Recipe", value=recipe_text, height=220, label_visibility="collapsed")
+
+            # Nutrition + tags
+            nutr = qualitative_nutrition(ings)
+            tags = dietary_tags(ings)
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Caloric density (0–1)", f"{nutr['caloric_density']:.2f}")
+            with c2:
+                st.metric("Protein index (0–1)", f"{nutr['protein_index']:.2f}")
+            with c3:
+                st.metric("Healthiness (0–1)", f"{nutr['healthiness']:.2f}")
+            st.caption(f"Dietary tags: {', '.join(tags) if tags else '—'}")
+
+            # Optional TTS: recipe reading
+            if enable_tts:
+                st.markdown("#### 🔊 Read recipe (English)")
+                audio_bytes = tts_bytes_en(recipe_text)
+                st.audio(audio_bytes, format="audio/mp3")
+
+            # Optional Podcast mode (single voice for reliability)
+            if enable_podcast:
+                st.markdown("#### 🎙️ Auto-podcast")
+                script = build_podcast_script(top1, ings, nutr, tags)
+                st.text_area("Podcast transcript", value=script, height=180, label_visibility="collapsed")
+                audio_pod = tts_bytes_en(script)
+                st.audio(audio_pod, format="audio/mp3")
+
+with col_right:
+    st.subheader("How to use")
+    st.markdown(
+        """
+        1. Enter ingredients (comma-separated or one per line).\n
+        2. Click **Find cuisine & build recipe**.\n
+        3. Review predictions, image, recipe, and nutrition hints.\n
+        4. (Optional) Enable **voice** or **podcast** in the sidebar.
+        """
+    )
+
+st.markdown("---")
+st.caption("Tip: You can package this as a business demo (meal helper, shopping list recommender, or cooking coach).")
