@@ -1,4 +1,5 @@
-# app.py — Smart Recipe Finder (Top-3 cuisines • 3 recipe options • pro charts • selectable voices • podcast)
+# app.py — Smart Recipe Finder
+# Top-3 cuisines • 3 recipe options • pro Plotly charts • selectable voices • conversational podcast
 from __future__ import annotations
 import io, json, re, asyncio
 from pathlib import Path
@@ -291,7 +292,8 @@ with left:
     ings = parse_ingredients(ing_text)
 
     # --- Predict (one-time) ---
-    run = st.button("Predict cuisines & build 3 recipe options", type="primary", use_container_width=True, key="predict_btn")
+    run = st.button("Predict cuisines & build 3 recipe options", type="primary",
+                    use_container_width=True, key="predict_btn")
     if run:
         if not ings:
             st.warning("Please provide at least one ingredient.")
@@ -309,7 +311,8 @@ with left:
             fvs    = food_value_score(nutr)
             options_meta[c] = {"recipe": recipe, "macro": macro, "nutr": nutr, "fvs": fvs}
 
-        tab_labels = [f"{c.title()} • {int(options_meta[c]['macro']['kcal']):d} kcal • FVS {options_meta[c]['fvs']:.2f}" for c in cuisines]
+        tab_labels = [f"{c.title()} • {int(options_meta[c]['macro']['kcal']):d} kcal • FVS {options_meta[c]['fvs']:.2f}"
+                      for c in cuisines]
 
         st.session_state["pred_ready"]   = True
         st.session_state["df_pred"]      = df_pred
@@ -332,7 +335,7 @@ with left:
             go.Bar(
                 x=df_pred["cuisine"],
                 y=df_pred["probability"],
-                marker_color=["#4C78A8", "#F58518", "#54A24B"],  # distinct, colorblind-friendly
+                marker_color=["#4C78A8", "#F58518", "#54A24B"],
             )
         ])
         fig_pred.update_layout(
@@ -342,7 +345,8 @@ with left:
             height=300,
             template="simple_white",
         )
-        st.plotly_chart(fig_pred, use_container_width=True, config={"displayModeBar": False}, key="pred_chart")
+        st.plotly_chart(fig_pred, use_container_width=True,
+                        config={"displayModeBar": False}, key="pred_chart")
 
         # Tabs to preview all three recipes
         st.markdown("### Explore three recipe options")
@@ -350,7 +354,8 @@ with left:
         for tab, c in zip(tabs, cuisines):
             with tab:
                 st.markdown(f"**Cuisine:** {c.title()}")
-                st.image(cuisine_image_url(c), use_column_width=True, key=f"img_{c}")
+                # NOTE: st.image has no 'key' parameter — do NOT pass key
+                st.image(cuisine_image_url(c), use_column_width=True)
                 st.text_area("Recipe preview", value=options_meta[c]["recipe"], height=220,
                              label_visibility="collapsed", key=f"recipe_preview_{c}")
 
@@ -367,7 +372,8 @@ with left:
                     height=300,
                     template="simple_white",
                 )
-                st.plotly_chart(fig_macro, use_container_width=True, config={"displayModeBar": False}, key=f"macro_{c}")
+                st.plotly_chart(fig_macro, use_container_width=True,
+                                config={"displayModeBar": False}, key=f"macro_{c}")
 
                 # Value chart — colored columns (unique key)
                 n = options_meta[c]["nutr"]
@@ -383,7 +389,8 @@ with left:
                     height=300,
                     template="simple_white",
                 )
-                st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False}, key=f"value_{c}")
+                st.plotly_chart(fig_val, use_container_width=True,
+                                config={"displayModeBar": False}, key=f"value_{c}")
 
         # Choose which recipe to voice/podcast
         st.markdown("### Choose a recipe for voice & podcast")
