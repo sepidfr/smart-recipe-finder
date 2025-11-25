@@ -1,14 +1,6 @@
-# app.py
-# ============================================================
-# Smart Recipe Finder • Cuisine Classification + Recipe Builder
-# TF–IDF + Logistic Regression (joblib) • Streamlit UI
-# Top-k cuisines, image, recipe, nutrition, value score
-# Dual-voice Podcast (HOST/ CHEF) via gTTS accents
-# Safe fallback when pydub/ffmpeg not available
-# ============================================================
-
+# app.py — Smart Recipe Finder (Top-3 options + selectable recipe + nutrition + dual-voice podcast)
 from __future__ import annotations
-import io, json, re, textwrap
+import io, json, re, textwrap, asyncio
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -18,30 +10,38 @@ import joblib
 import streamlit as st
 
 # ---------- Optional audio deps ----------
-def _safe_import_gtts():
+def _try_import_edge_tts():
+    try:
+        import edge_tts
+        return edge_tts
+    except Exception:
+        return None
+
+def _try_import_gtts():
     try:
         from gtts import gTTS
         return gTTS
     except Exception:
         return None
 
-def _safe_import_pydub():
+def _try_import_pydub():
     try:
         from pydub import AudioSegment
         return AudioSegment
     except Exception:
         return None
 
-gTTS = _safe_import_gtts()
-AudioSegment = _safe_import_pydub()
+EDGE_TTS = _try_import_edge_tts()
+gTTS     = _try_import_gtts()
+AudioSeg = _try_import_pydub()
 
 # ---------- Paths / constants ----------
-APP_DIR = Path(__file__).resolve().parent
-MODEL_PATH = APP_DIR / "cuisine_pipeline.joblib"
+APP_DIR   = Path(__file__).resolve().parent
+MODEL_PATH  = APP_DIR / "cuisine_pipeline.joblib"
 LABELS_PATH = APP_DIR / "labels.json"
 
 TITLE = "Smart Recipe Finder"
-TOPK = 3
+TOPK  = 3
 np.random.seed(42)
 
 # ---------- Nutrition table (per 100 g) ----------
@@ -69,25 +69,15 @@ NUTR_TABLE = {
 
 # ---------- Cache ----------
 @st.cache_resource(show_spinner="Loading model pipeline...")
-def load_pipeline() -> Tuple[object, Dict[int,str]]:
+def load_pipeline():
     if not MODEL_PATH.exists():
-        st.error(f"Missing model at {MODEL_PATH}")
-        st.stop()
-    pipe = joblib.load(MODEL_PATH)
-
+        st.error(f"Missing model at {MODEL_PATH}"); st.stop()
     if not LABELS_PATH.exists():
-        st.error(f"Missing labels at {LABELS_PATH}")
-        st.stop()
-    with open(LABELS_PATH, "r", encoding="utf-8") as f:
-        labels = json.load(f)
-
-    if isinstance(labels, list):
-        inv = {i: name for i, name in enumerate(labels)}
-    elif isinstance(labels, dict):
-        inv = {int(k): v for k, v in labels.items()}
-    else:
-        st.error("labels.json must be list or {index->name} dict.")
-        st.stop()
+        st.error(f"Missing labels at {LABELS_PATH}"); st.stop()
+    pipe = joblib.load(MODEL_PATH)
+    labels_raw = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
+    inv = {i: n for i, n in enumerate(labels_raw)} if isinstance(labels_raw, list) \
+         else {int(k): v for k, v in labels_raw.items()}
     return pipe, inv
 
 # ---------- Helpers ----------
@@ -117,13 +107,13 @@ def estimate_nutrition(items: List[str], default_mass_g: float = 100.0) -> Dict[
                 break
     return tot
 
-def predict_topk(pipe, inv_labels: Dict[int,str], ings: List[str], k: int = TOPK):
+def predict_topk(pipe, inv_labels, ings: List[str], k: int = TOPK):
     text = " ".join(ings)
     proba = pipe.predict_proba([text])[0]
     order = np.argsort(proba)[::-1][:k]
     names = [inv_labels[i] for i in order]
     values = proba[order]
-    return names, values, proba
+    return names, values
 
 def qualitative_nutrition(ings: List[str]) -> Dict[str, float | str]:
     s = " ".join(ings).lower()
@@ -154,6 +144,18 @@ def dietary_tags(ings: List[str]) -> List[str]:
 def food_value_score(n: Dict[str,float]) -> float:
     return float(np.clip(0.35*n["protein_index"] + 0.40*n["healthiness"] - 0.25*n["caloric_density"], 0.0, 1.0))
 
+# ---------- Recipe generation ----------
+FLAIR = {
+    "indian":"Finish with garam masala and fresh cilantro.",
+    "chinese":"Add a 1–1 splash of soy sauce and rice vinegar; sesame oil off-heat.",
+    "italian":"Deglaze with a touch of white wine; finish with olive oil and basil.",
+    "mexican":"Add cumin and chili powder; finish with lime and cilantro.",
+    "japanese":"Season with mirin and soy; garnish with scallion.",
+    "korean":"Stir in gochujang; top with sesame seeds.",
+    "french":"Mount with a small knob of butter; finish with parsley/chives.",
+    "thai":"Balance sweet–sour–salty with palm sugar, lime, fish sauce."
+}
+
 def generate_recipe(cuisine: str, ings: List[str]) -> str:
     title = f"{cuisine.title()} Style Dish with {', '.join(ings[:3]).title() if ings else 'Seasonal Ingredients'}"
     steps = [
@@ -164,63 +166,66 @@ def generate_recipe(cuisine: str, ings: List[str]) -> str:
         "Adjust with acid (lemon/lime/vinegar) and fresh herbs.",
         "Taste, correct seasoning, and serve warm."
     ]
-    flair = {
-        "indian":"Finish with garam masala and fresh cilantro.",
-        "chinese":"Add a 1–1 splash of soy sauce and rice vinegar; sesame oil off-heat.",
-        "italian":"Deglaze with a touch of white wine; finish with olive oil and basil.",
-        "mexican":"Add cumin and chili powder; finish with lime and cilantro.",
-        "japanese":"Season with mirin and soy; garnish with scallion.",
-        "korean":"Stir in gochujang; top with sesame seeds.",
-        "french":"Mount with a small knob of butter; finish with parsley/chives.",
-        "thai":"Balance sweet–sour–salty with palm sugar, lime, fish sauce."
-    }
-    steps.append(flair.get(cuisine.lower(), "Finish with fresh herbs and a drizzle of good olive oil."))
+    steps.append(FLAIR.get(cuisine.lower(), "Finish with fresh herbs and a drizzle of good olive oil."))
     return f"{title}\n\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
 
-# ---------- Dual-voice podcast ----------
-def build_podcast_dialogue(cuisine: str, ings: List[str], nutr: Dict[str,float], tags: List[str]) -> List[Tuple[str,str]]:
-    """Return a turn-by-turn dialogue without speaker tags in the spoken text."""
+# ---------- Dual-voice podcast (female host, male chef) ----------
+async def _edge_tts_bytes_async(text: str, voice: str, rate: str = "+0%", volume: str = "+0%") -> bytes:
+    tts = EDGE_TTS.Communicate(text=text, voice=voice, rate=rate, volume=volume)
+    stream = io.BytesIO()
+    async for chunk in tts.stream():
+        if chunk["type"] == "audio":
+            stream.write(chunk["data"])
+    return stream.getvalue()
+
+def tts_bytes_voice(text: str, role: str) -> bytes | None:
+    # Preferred: Microsoft Edge voices
+    if EDGE_TTS is not None:
+        voice = "en-US-JennyNeural" if role == "HOST" else "en-US-GuyNeural"
+        try:
+            return asyncio.run(_edge_tts_bytes_async(text, voice))
+        except Exception:
+            pass
+    # Fallback: gTTS (accent swap only)
+    if gTTS is not None:
+        tld = "co.uk" if role == "HOST" else "com.au"
+        try:
+            tts = gTTS(text=text, lang="en", tld=tld)
+            buf = io.BytesIO(); tts.write_to_fp(buf)
+            return buf.getvalue()
+        except Exception:
+            return None
+    return None
+
+def build_podcast_dialogue(host_name: str, chef_name: str, cuisine: str, ings: List[str],
+                           nutr: Dict[str,float], tags: List[str]) -> List[Tuple[str,str]]:
     ttags = ", ".join(tags) if tags else "balanced"
     lines = [
-        ("HOST", f"Welcome to Quick Plates. Today we explore {cuisine.title()} flavors."),
-        ("HOST", f"Our basket has {', '.join(ings)}."),
-        ("CHEF", "Great pick. For a fast home version, sauté aromatics, add your main ingredient, and finish with regional staples."),
-        ("HOST", "Quick nutrition?"),
-        ("CHEF", f"Caloric density is {nutr['calorie_band']}, protein index {nutr['protein_index']:.2f}, and healthiness {nutr['healthiness']:.2f}."),
-        ("CHEF", f"Dietary hints: {ttags}."),
-        ("HOST", "Final touch?"),
-        ("CHEF", "Always taste and balance at the end. Acid and fresh herbs bring the dish to life.")
+        ("HOST", f"Hello! I'm {host_name}. Today we have Chef {chef_name} with us to explore {cuisine.title()} flavors."),
+        ("CHEF", f"Hi! Great to be here. With {', '.join(ings)}, we can make a quick, aromatic dish."),
+        ("HOST", "What’s the first move?"),
+        ("CHEF", "Bloom the aromatics gently in oil, then add the main ingredient and cook through."),
+        ("HOST", "Give us a quick nutrition snapshot."),
+        ("CHEF", f"Caloric density is {nutr['calorie_band']}, protein index {nutr['protein_index']:.2f}, healthiness {nutr['healthiness']:.2f}."),
+        ("CHEF", f"Dietary tags: {ttags}."),
+        ("HOST", "Your final tip?"),
+        ("CHEF", "Finish with acid and fresh herbs—this brightens everything.")
     ]
     return lines
 
-def tts_bytes_en_voice(text: str, role: str) -> bytes | None:
-    """Two distinct accents via gTTS tld: HOST=British, CHEF=Australian."""
-    if gTTS is None:
-        return None
-    tld = "co.uk" if role == "HOST" else "com.au"
-    try:
-        tts = gTTS(text=text, lang="en", tld=tld)
-        buf = io.BytesIO()
-        tts.write_to_fp(buf)
-        return buf.getvalue()
-    except Exception:
-        return None
-
-def render_dual_voice_audio(dialogue: List[Tuple[str,str]], pause_ms: int = 250) -> bytes | None:
-    """If pydub/ffmpeg available, stitch into one mp3; otherwise return None."""
-    if AudioSegment is None:
+def render_dual_voice_audio(dialogue: List[Tuple[str,str]], pause_ms: int = 300) -> bytes | None:
+    if AudioSeg is None:
         return None
     try:
-        track = AudioSegment.silent(duration=50)
-        gap = AudioSegment.silent(duration=max(0, int(pause_ms)))
+        track = AudioSeg.silent(duration=50)
+        gap = AudioSeg.silent(duration=max(0, int(pause_ms)))
         for role, text in dialogue:
-            audio_bytes = tts_bytes_en_voice(text, role)
-            if not audio_bytes:
+            b = tts_bytes_voice(text, role)
+            if not b:
                 return None
-            seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+            seg = AudioSeg.from_file(io.BytesIO(b), format="mp3")
             track += seg + gap
-        out = io.BytesIO()
-        track.export(out, format="mp3")
+        out = io.BytesIO(); track.export(out, format="mp3")
         return out.getvalue()
     except Exception:
         return None
@@ -228,13 +233,15 @@ def render_dual_voice_audio(dialogue: List[Tuple[str,str]], pause_ms: int = 250)
 # ======================= UI =======================
 st.set_page_config(page_title=TITLE, page_icon="🍽️", layout="wide")
 st.title(TITLE)
-st.caption("Cuisine prediction + auto recipe + nutrition hints")
+st.caption("Cuisine prediction + three recipe options + nutrition and dual-voice podcast")
 
 # Sidebar
 st.sidebar.header("Settings")
-enable_tts = st.sidebar.checkbox("Enable voice for recipe (English TTS)", value=False)
-enable_podcast = st.sidebar.checkbox("Dual-voice podcast (English)", value=False)
-podcast_pause = st.sidebar.slider("Pause between turns (ms)", 150, 800, 300, step=50)
+enable_recipe_tts = st.sidebar.checkbox("Enable voice for recipe (English)", value=False)
+enable_podcast    = st.sidebar.checkbox("Dual-voice podcast (female host, male chef)", value=True)
+podcast_pause     = st.sidebar.slider("Pause between dialogue turns (ms)", 150, 800, 300, step=50)
+host_name         = st.sidebar.text_input("Host name", value="Sara")
+chef_name         = st.sidebar.text_input("Chef name", value="Masoud")
 
 with st.sidebar.expander("About the model", expanded=True):
     st.markdown("- Logistic Regression over TF–IDF features\n- Trained on the Yummly ‘What’s Cooking?’ dataset")
@@ -243,7 +250,7 @@ with st.sidebar.expander("About the model", expanded=True):
 pipe, INV = load_pipeline()
 st.sidebar.markdown(f"- Classes: **{len(INV)}**")
 
-# Layout
+# Main
 left, right = st.columns([1.25, 1.0], vertical_alignment="top")
 
 with left:
@@ -253,95 +260,89 @@ with left:
                             placeholder="e.g., tomato, basil, garlic, olive oil")
     ings = parse_ingredients(ing_text)
 
-    run = st.button("Find cuisine & build recipe", type="primary", use_container_width=True)
+    run = st.button("Predict cuisines & propose three recipes", type="primary", use_container_width=True)
     if run:
         if not ings:
-            st.warning("Please provide at least one ingredient.")
-            st.stop()
+            st.warning("Please provide at least one ingredient."); st.stop()
 
-        names, values, _ = predict_topk(pipe, INV, ings, k=TOPK)
+        # Top-3 cuisines
+        names, values = predict_topk(pipe, INV, ings, k=TOPK)
+        df_pred = pd.DataFrame({"cuisine": names, "probability": values})
+        st.markdown("### Top predictions")
+        st.bar_chart(df_pred.set_index("cuisine")["probability"], use_container_width=True)
 
-        st.markdown("### Prediction & Recipe")
-        col1, col2 = st.columns([3,2], vertical_alignment="top")
-
-        with col1:
-            st.markdown("#### Top cuisines")
-            df_pred = pd.DataFrame({"cuisine": names, "probability": values})
-            st.bar_chart(df_pred.set_index("cuisine")["probability"], use_container_width=True)
-
-        with col2:
-            st.markdown("#### Nutrition (approx. per serving)")
+        # Build 3 recipe options
+        options = []
+        option_meta = {}
+        for c in names:
+            rec = generate_recipe(c, ings)
             macro = estimate_nutrition(ings, default_mass_g=100.0)
-            nutr = qualitative_nutrition(ings)
-            tags = dietary_tags(ings)
-            score = food_value_score(nutr)
+            nutr  = qualitative_nutrition(ings)
+            fv    = food_value_score(nutr)
+            title = f"{c.title()} • {macro['kcal']:.0f} kcal • FVS {fv:.2f}"
+            options.append(title)
+            option_meta[title] = {"cuisine": c, "recipe": rec, "macro": macro, "nutr": nutr, "fvs": fv}
 
-            st.metric("Calories", f"{macro['kcal']:.0f} kcal")
-            a,b,c = st.columns(3)
-            a.metric("Protein", f"{macro['protein']:.1f} g")
-            b.metric("Fat",     f"{macro['fat']:.1f} g")
-            c.metric("Carbs",   f"{macro['carbs']:.1f} g")
-            st.caption(f"Caloric density (0–1): {nutr['caloric_density']:.2f} • "
-                       f"Protein index (0–1): {nutr['protein_index']:.2f} • "
-                       f"Healthiness (0–1): {nutr['healthiness']:.2f} • "
-                       f"Food Value Score: {score:.2f}")
-            st.caption(f"Dietary tags: {', '.join(tags) if tags else '—'}")
+        st.markdown("### Choose one recipe to view")
+        choice = st.selectbox("Recipe options (cuisine • calories • value):", options, index=0, label_visibility="collapsed")
 
-        top1 = names[0]
-        st.markdown(f"### Image • {top1.title()}")
-        st.image(cuisine_image_url(top1), use_column_width=True)
+        # Display selected recipe
+        meta = option_meta[choice]
+        csel, rsel, msel, nsel, fvsel = meta["cuisine"], meta["recipe"], meta["macro"], meta["nutr"], meta["fvs"]
 
-        st.markdown("### 🧾 Generated Recipe")
-        recipe_text = generate_recipe(top1, ings)
-        st.text_area("Recipe", value=recipe_text, height=220, label_visibility="collapsed")
+        st.markdown(f"### Image • {csel.title()}")
+        st.image(cuisine_image_url(csel), use_column_width=True)
 
-        # Single-voice recipe TTS (optional)
-        if enable_tts:
-            st.markdown("#### 🔊 Read recipe (English)")
-            if gTTS:
-                try:
-                    # neutral US accent for recipe
-                    from_gtts = gTTS(text=recipe_text, lang="en", tld="com")
-                    buf = io.BytesIO(); from_gtts.write_to_fp(buf)
-                    st.audio(buf.getvalue(), format="audio/mp3")
-                except Exception:
-                    st.info("TTS unavailable in this environment.")
-            else:
-                st.info("TTS unavailable in this environment.")
+        st.markdown("### 🧾 Recipe")
+        st.text_area("Recipe text", value=rsel, height=240, label_visibility="collapsed")
 
-        # Dual-voice podcast (alternating HOST / CHEF)
+        # Nutrition block for selected option
+        st.markdown("### Nutrition (approx. per serving)")
+        cA, cB, cC, cD = st.columns(4)
+        cA.metric("Calories", f"{msel['kcal']:.0f} kcal")
+        cB.metric("Protein",  f"{msel['protein']:.1f} g")
+        cC.metric("Fat",      f"{msel['fat']:.1f} g")
+        cD.metric("Carbs",    f"{msel['carbs']:.1f} g")
+        st.caption(f"Caloric density (0–1): {nsel['caloric_density']:.2f} • "
+                   f"Protein index (0–1): {nsel['protein_index']:.2f} • "
+                   f"Healthiness (0–1): {nsel['healthiness']:.2f} • "
+                   f"Food Value Score: {fvsel:.2f}")
+        st.caption(f"Dietary tags: {', '.join(dietary_tags(ings)) or '—'}")
+
+        # Optional: single-voice recipe TTS (use female host voice)
+        if enable_recipe_tts:
+            st.markdown("#### 🔊 Voice recipe")
+            audio = tts_bytes_voice(rsel, "HOST")
+            if audio: st.audio(audio, format="audio/mp3")
+            else:     st.info("TTS unavailable in this environment.")
+
+        # Optional: dual-voice podcast for the chosen cuisine
         if enable_podcast:
-            st.markdown("#### 🎙️ Podcast (dual-voice)")
-            dialogue = build_podcast_dialogue(top1, ings, qualitative_nutrition(ings), dietary_tags(ings))
-
-            # transcript (with labels for display only)
-            transcript = "\n".join([f"**{r}:** {t}" for r,t in dialogue])
-            st.markdown(transcript)
-
-            # one combined track if possible; otherwise per-turn players
+            st.markdown("#### 🎙️ Podcast (host=female, chef=male)")
+            dialogue = build_podcast_dialogue(host_name, chef_name, csel, ings, nsel, dietary_tags(ings))
+            st.markdown("\n".join([f"**{r}:** {t}" for r,t in dialogue]))
             combined = render_dual_voice_audio(dialogue, pause_ms=int(podcast_pause))
             if combined:
                 st.audio(combined, format="audio/mp3")
             else:
-                st.caption("Playing turns separately (fallback mode).")
-                for i, (role, text) in enumerate(dialogue, start=1):
-                    audio_bytes = tts_bytes_en_voice(text, role)
-                    if audio_bytes:
-                        st.markdown(f"*Turn {i} — {role}*")
-                        st.audio(audio_bytes, format="audio/mp3")
+                st.caption("Fallback: playing turns separately.")
+                for i,(r,t) in enumerate(dialogue,1):
+                    b = tts_bytes_voice(t, r)
+                    if b:
+                        st.markdown(f"*Turn {i} — {r}*")
+                        st.audio(b, format="audio/mp3")
                     else:
-                        st.info("TTS unavailable in this environment.")
-                        break
+                        st.info("TTS unavailable in this environment."); break
 
 with right:
     st.subheader("How to use")
     st.markdown(
         "1) Enter ingredients\n\n"
-        "2) Click **Find cuisine & build recipe**\n\n"
-        "3) Review predictions (left) and **Nutrition** (right)\n\n"
-        "4) See image & recipe\n\n"
-        "5) Optional: enable **voice** or **dual-voice podcast**"
+        "2) Click **Predict cuisines & propose three recipes**\n\n"
+        "3) Review the **top-3 cuisines** and **select one recipe**\n\n"
+        "4) See image, recipe text, **calories/macros**, and **Food Value Score**\n\n"
+        "5) Optionally play **voice recipe** and **dual-voice podcast**"
     )
 
 st.markdown("---")
-st.caption("Demo: meal helper / shopping assistant / cooking coach.")
+st.caption("Meal helper • shopping assistant • cooking coach")
