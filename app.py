@@ -1,4 +1,4 @@
-# app.py — Smart Recipe Finder (Top-3 cuisines • 3 recipe options • pro charts • selectable voices • conversational podcast)
+# app.py — Smart Recipe Finder (state-synced selection → recipe/voice/podcast)
 from __future__ import annotations
 import io, json, re, asyncio
 from pathlib import Path
@@ -162,12 +162,8 @@ def generate_recipe(cuisine: str, ings: List[str]) -> str:
     return f"{title}\n\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
 
 # -------------------- Conversational podcast ----------------
-EDGE_FEMALE_CHOICES = [
-    "en-US-JennyNeural", "en-GB-LibbyNeural", "en-AU-NatashaNeural", "en-CA-ClaraNeural"
-]
-EDGE_MALE_CHOICES = [
-    "en-US-GuyNeural", "en-GB-RyanNeural", "en-AU-WilliamNeural", "en-IN-PrabhatNeural"
-]
+EDGE_FEMALE_CHOICES = ["en-US-JennyNeural","en-GB-LibbyNeural","en-AU-NatashaNeural","en-CA-ClaraNeural"]
+EDGE_MALE_CHOICES   = ["en-US-GuyNeural","en-GB-RyanNeural","en-AU-WilliamNeural","en-IN-PrabhatNeural"]
 
 def _ssml_wrap_chat(text: str, rate: str = "+0%", pitch: str = "+0%") -> str:
     safe = (text or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
@@ -252,11 +248,11 @@ st.sidebar.header("Audio Settings")
 st.sidebar.markdown(f"- Edge TTS available: **{'Yes' if EDGE_OK else 'No (fallback to gTTS)'}**")
 st.sidebar.markdown(f"- Single MP3 stitch: **{'Yes' if PYDUB_OK else 'No (install ffmpeg)'}**")
 
-host_voice = None
-chef_voice = None
+host_voice = EDGE_FEMALE_CHOICES[0] if EDGE_OK else None
+chef_voice = EDGE_MALE_CHOICES[0]   if EDGE_OK else None
 if EDGE_OK:
-    host_voice = st.sidebar.selectbox("Host voice (female)", ["en-US-JennyNeural","en-GB-LibbyNeural","en-AU-NatashaNeural","en-CA-ClaraNeural"], index=0, key="host_voice_sel")
-    chef_voice = st.sidebar.selectbox("Chef voice (male)",   ["en-US-GuyNeural","en-GB-RyanNeural","en-AU-WilliamNeural","en-IN-PrabhatNeural"], index=0, key="chef_voice_sel")
+    host_voice = st.sidebar.selectbox("Host voice (female)", EDGE_FEMALE_CHOICES, index=0, key="host_voice_sel")
+    chef_voice = st.sidebar.selectbox("Chef voice (male)",   EDGE_MALE_CHOICES,   index=0, key="chef_voice_sel")
 else:
     st.sidebar.info("Edge voices unavailable: using gTTS fallback (not truly gendered).")
 
@@ -304,15 +300,11 @@ with left:
             fvs    = food_value_score(nutr)
             options_meta[c] = {"recipe": recipe, "macro": macro, "nutr": nutr, "fvs": fvs}
 
-        tab_labels = [f"{c.title()} • {int(options_meta[c]['macro']['kcal']):d} kcal • FVS {options_meta[c]['fvs']:.2f}"
-                      for c in cuisines]
-
         st.session_state["pred_ready"]      = True
         st.session_state["df_pred"]         = df_pred
         st.session_state["cuisines"]        = cuisines
         st.session_state["options_meta"]    = options_meta
-        st.session_state["tab_labels"]      = tab_labels
-        st.session_state["selected_cuisine"]= cuisines[0]      # default selection = top-1
+        st.session_state["selected_cuisine"]= cuisines[0]    # default = top-1
         st.rerun()
 
 # Render
@@ -321,87 +313,81 @@ with left:
         df_pred      = st.session_state["df_pred"]
         cuisines     = st.session_state["cuisines"]
         options_meta = st.session_state["options_meta"]
-        tab_labels   = st.session_state["tab_labels"]
         selected     = st.session_state.get("selected_cuisine", cuisines[0])
 
+        # Top predictions chart
         st.markdown("### Top predictions")
         fig_pred = go.Figure(data=[go.Bar(x=df_pred["cuisine"], y=df_pred["probability"],
                                           marker_color=["#4C78A8", "#F58518", "#54A24B"])])
         fig_pred.update_layout(margin=dict(l=0, r=0, t=10, b=0),
-                               yaxis=dict(title="Probability", rangemode="tozero"),
+                               yaxis=dict(title="Proba", rangemode="tozero"),
                                xaxis=dict(title="Cuisine"), height=300, template="simple_white")
         st.plotly_chart(fig_pred, use_container_width=True, config={"displayModeBar": False}, key="pred_chart")
 
+        # ------- Single source of truth: radio selection -------
         st.markdown("### Explore three recipe options")
-        tabs = st.tabs(tab_labels)
-        for tab, c in zip(tabs, cuisines):
-            with tab:
-                st.markdown(f"**Cuisine:** {c.title()}")
-                st.image(cuisine_image_url(c), use_column_width=True)  # no key
-                st.text_area("Recipe preview", value=options_meta[c]["recipe"], height=220,
-                             label_visibility="collapsed", key=f"recipe_preview_{c}")
+        chosen = st.radio(
+            "Pick one to preview & voice:",
+            options=cuisines,
+            index=cuisines.index(selected),
+            horizontal=True,
+            label_visibility="collapsed",
+            key="recipe_radio",
+        )
+        if chosen != selected:
+            st.session_state["selected_cuisine"] = chosen
+            selected = chosen
 
-                # Macro chart
-                m = options_meta[c]["macro"]
-                macro_names = ["Calories (kcal)", "Protein (g)", "Fat (g)", "Carbs (g)"]
-                macro_vals  = [m["kcal"], m["protein"], m["fat"], m["carbs"]]
-                fig_macro = go.Figure(data=[go.Bar(x=macro_names, y=macro_vals,
-                                                   marker_color=["#3E7CB1", "#66C2A5", "#FC8D62", "#8DA0CB"])])
-                fig_macro.update_layout(margin=dict(l=0, r=0, t=10, b=0),
-                                        yaxis=dict(title="Amount", rangemode="tozero"),
-                                        xaxis=dict(title=""), height=300, template="simple_white")
-                st.plotly_chart(fig_macro, use_container_width=True, config={"displayModeBar": False}, key=f"macro_{c}")
+        # ------- Preview for the selected recipe only ----------
+        c = selected
+        st.markdown(f"**Cuisine:** {c.title()}")
+        st.image(cuisine_image_url(c), use_column_width=True)
+        st.text_area("Recipe", value=options_meta[c]["recipe"], height=220,
+                     label_visibility="collapsed", key=f"recipe_preview_{c}")
 
-                # Value chart
-                n = options_meta[c]["nutr"]
-                value_names = ["Caloric density", "Protein index", "Healthiness", "Food Value Score"]
-                value_vals  = [n["caloric_density"], n["protein_index"], n["healthiness"], options_meta[c]["fvs"]]
-                fig_val = go.Figure(data=[go.Bar(x=value_names, y=value_vals,
-                                                 marker_color=["#A6CEE3", "#1F78B4", "#33A02C", "#FB9A99"])])
-                fig_val.update_yaxes(range=[0, 1])
-                fig_val.update_layout(margin=dict(l=0, r=0, t=10, b=0),
-                                      yaxis=dict(title="Score (0–1)", rangemode="tozero"),
-                                      xaxis=dict(title=""), height=300, template="simple_white")
-                st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False}, key=f"value_{c}")
+        # Macro chart
+        m = options_meta[c]["macro"]
+        macro_names = ["Calories (kcal)", "Protein (g)", "Fat (g)", "Carbs (g)"]
+        macro_vals  = [m["kcal"], m["protein"], m["fat"], m["carbs"]]
+        fig_macro = go.Figure(data=[go.Bar(x=macro_names, y=macro_vals,
+                                           marker_color=["#3E7CB1", "#66C2A5", "#FC8D62", "#8DA0CB"])])
+        fig_macro.update_layout(margin=dict(l=0, r=0, t=10, b=0),
+                                yaxis=dict(title="Amount", rangemode="tozero"),
+                                xaxis=dict(title=""), height=300, template="simple_white")
+        st.plotly_chart(fig_macro, use_container_width=True, config={"displayModeBar": False}, key=f"macro_{c}")
 
-                # NEW: bind tab → selection
-                if st.button(f"Use {c.title()} for voice & podcast", key=f"use_{c}"):
-                    st.session_state["selected_cuisine"] = c
-                    st.rerun()
+        # Value chart
+        n = options_meta[c]["nutr"]
+        value_names = ["Caloric density", "Protein index", "Healthiness", "Food Value Score"]
+        value_vals  = [n["caloric_density"], n["protein_index"], n["healthiness"], options_meta[c]["fvs"]]
+        fig_val = go.Figure(data=[go.Bar(x=value_names, y=value_vals,
+                                         marker_color=["#A6CEE3", "#1F78B4", "#33A02C", "#FB9A99"])])
+        fig_val.update_yaxes(range=[0, 1])
+        fig_val.update_layout(margin=dict(l=0, r=0, t=10, b=0),
+                              yaxis=dict(title="Score (0–1)", rangemode="tozero"),
+                              xaxis=dict(title=""), height=300, template="simple_white")
+        st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False}, key=f"value_{c}")
 
-        # Selection UI synced with state
-        st.markdown("### Choose a recipe for voice & podcast")
-        current_label = {c: lab for c, lab in zip(cuisines, tab_labels)}[selected]
-        new_label = st.selectbox("Select one:", tab_labels, index=tab_labels.index(current_label),
-                                 label_visibility="collapsed", key="recipe_select_label")
-        new_selected = {lab: c for c, lab in zip(cuisines, tab_labels)}[new_label]
-        if new_selected != selected:
-            st.session_state["selected_cuisine"] = new_selected
-            st.rerun()
-
-        sel = options_meta[st.session_state["selected_cuisine"]]
-
-        # Voice (no key)
+        # ---------------- Voice ----------------
         if enable_recipe_tts:
             st.markdown("#### 🔊 Voice recipe")
-            audio = tts_bytes_any(sel["recipe"], role="HOST", voice_name=host_voice,
+            audio = tts_bytes_any(options_meta[c]["recipe"], role="HOST", voice_name=host_voice,
                                   rate=voice_rate, pitch=voice_pitch)
             if audio:
-                st.audio(audio, format="audio/mp3")  # no key
+                st.audio(audio, format="audio/mp3")   # no key
             else:
                 st.info("TTS unavailable in this environment (Edge blocked and/or gTTS missing).")
 
-        # Podcast (no key on audio widgets)
+        # ---------------- Podcast ----------------
         if enable_podcast:
             st.markdown("#### 🎙️ Conversational podcast (Host ↔ Chef)")
-            dlg = build_podcast_dialogue(host_name, chef_name, st.session_state["selected_cuisine"],
-                                         ings, sel["nutr"], dietary_tags(ings))
-            st.markdown("\n".join([f"**{r}:** {t}" for r,t in dlg]))
+            dlg = build_podcast_dialogue(host_name, chef_name, c, ings, n, dietary_tags(ings))
+            st.markdown("\n".join([f"**{r}:** {t}" for r, t in dlg]))
 
             stitched = stitch_dialogue(dlg, host_voice, chef_voice, pause_ms=int(podcast_pause),
                                        rate=voice_rate, pitch=voice_pitch)
             if stitched:
-                st.audio(stitched, format="audio/mp3")
+                st.audio(stitched, format="audio/mp3")  # no key
             else:
                 st.caption("Playing per-turn (single-file stitch unavailable).")
                 for i, (role, text) in enumerate(dlg, 1):
@@ -419,9 +405,8 @@ with right:
     st.markdown(
         "1) Enter ingredients\n\n"
         "2) Click **Predict cuisines & build 3 recipe options**\n\n"
-        "3) Explore tabs; click **Use this recipe** to bind it to voice/podcast\n\n"
-        "4) Or pick from the dropdown; both stay in sync\n\n"
-        "5) Choose female host & male chef voices in the sidebar"
+        "3) Use the **radio** to pick the cuisine — everything syncs to that\n\n"
+        "4) Turn on **Voice** and/or **Podcast** in the sidebar and choose voices"
     )
 
 st.markdown("---")
