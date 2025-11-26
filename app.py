@@ -1,36 +1,34 @@
-# app.py — Smart Recipe Finder
-# Top-k cuisine prediction • 3 recipe options • calories/macros • selectable voices • conversational podcast
-
+# app.py — Smart Recipe Finder (Bing/Unsplash images → Wikimedia → placeholder)
 from __future__ import annotations
-import io, json, re, asyncio, requests
+import io, json, re, asyncio
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import requests
 import numpy as np
 import pandas as pd
 import joblib
 import streamlit as st
 import plotly.graph_objects as go
 
-# -------------------- Optional audio deps --------------------
+# ---------- optional audio deps ----------
 def _has_edge_tts() -> bool:
     try:
-        import edge_tts  # noqa: F401
+        import edge_tts  # noqa
         return True
     except Exception:
         return False
 
 def _has_pydub() -> bool:
     try:
-        from pydub import AudioSegment  # noqa: F401
+        from pydub import AudioSegment  # noqa
         return True
     except Exception:
         return False
 
-EDGE_OK  = _has_edge_tts()
-PYDUB_OK = _has_pydub()
+EDGE_OK, PYDUB_OK = _has_edge_tts(), _has_pydub()
 
-# -------------------- Paths / constants ----------------------
+# ---------- paths / constants ----------
 APP_DIR     = Path(__file__).resolve().parent
 MODEL_PATH  = APP_DIR / "cuisine_pipeline.joblib"
 LABELS_PATH = APP_DIR / "labels.json"
@@ -39,7 +37,7 @@ TITLE = "Smart Recipe Finder"
 TOPK  = 3
 np.random.seed(42)
 
-# -------------------- Stable cuisine images -----------------
+# ---------- stable cuisine fallbacks ----------
 CUISINE_IMAGES = {
     "chinese":   "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/Cuisine_of_China.jpg/800px-Cuisine_of_China.jpg",
     "korean":    "https://upload.wikimedia.org/wikipedia/commons/thumb/0/05/Korean_cuisine-Kimchi.jpg/800px-Korean_cuisine-Kimchi.jpg",
@@ -48,7 +46,7 @@ CUISINE_IMAGES = {
     "indian":    "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/Indian_cuisine.jpg/800px-Indian_cuisine.jpg",
     "mexican":   "https://upload.wikimedia.org/wikipedia/commons/thumb/1/10/Tacos_de_carnitas.jpg/800px-Tacos_de_carnitas.jpg",
     "french":    "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/French_cuisine_-_duck_confit.jpg/800px-French_cuisine_-_duck_confit.jpg",
-    "thai":      "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0c/Pad_Thai_kung_Chang_Khien_street_stall.jpg/800px-Pad_Thai_kung_Chang_Khien_street_stall.jpg",
+    "thai":      "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0c/Pad_Thai_kung_Chang_Khien_street_stall.jpg/800px-PAD.jpg",
     "greek":     "https://upload.wikimedia.org/wikipedia/commons/thumb/8/81/Greek_meze.jpg/800px-Greek_meze.jpg",
     "spanish":   "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6a/Paella_mixta_01.jpg/800px-Paella_mixta_01.jpg",
     "british":   "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9a/Fish_and_chips_blackpool.jpg/800px-Fish_and_chips_blackpool.jpg",
@@ -57,23 +55,57 @@ CUISINE_IMAGES = {
     "moroccan":  "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2c/Tajine_Zitoune.jpg/800px-Tajine_Zitoune.jpg",
     "vietnamese":"https://upload.wikimedia.org/wikipedia/commons/thumb/5/5a/Ph%E1%BB%9F_in_Saigon.jpg/800px-Ph%E1%BB%9F_in_Saigon.jpg",
 }
-PLACEHOLDER_PNG = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ac/No_image_available.svg/512px-No_image_available.svg.png"
+PLACEHOLDER = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ac/No_image_available.svg/512px-No_image_available.svg.png"
 
-def get_cuisine_image_bytes(cuisine: str) -> bytes | None:
-    key = (cuisine or "").lower().strip()
-    urls = [CUISINE_IMAGES.get(key, ""), PLACEHOLDER_PNG]
-    for url in urls:
-        if not url:
-            continue
-        try:
-            r = requests.get(url, timeout=8)
-            if r.ok and r.content:
-                return r.content
-        except Exception:
-            continue
+def fetch_image_bytes(query_cuisine: str) -> bytes | None:
+    """
+    Priority: Bing (secrets['BING_KEY']) → Unsplash (secrets['UNSPLASH_KEY']) → Wikimedia map → placeholder.
+    """
+    q = f"{query_cuisine} cuisine plated dish"
+    # 1) Bing Image Search
+    try:
+        if "BING_KEY" in st.secrets and st.secrets["BING_KEY"]:
+            url = "https://api.bing.microsoft.com/v7.0/images/search"
+            params = {"q": q, "imageType": "Photo", "safeSearch": "Moderate", "count": 1, "license": "Public"}
+            headers = {"Ocp-Apim-Subscription-Key": st.secrets["BING_KEY"]}
+            r = requests.get(url, params=params, headers=headers, timeout=8)
+            if r.ok:
+                data = r.json()
+                if data.get("value"):
+                    src = data["value"][0].get("contentUrl") or data["value"][0].get("thumbnailUrl")
+                    if src:
+                        img = requests.get(src, timeout=8)
+                        if img.ok and img.content:
+                            return img.content
+    except Exception:
+        pass
+    # 2) Unsplash
+    try:
+        if "UNSPLASH_KEY" in st.secrets and st.secrets["UNSPLASH_KEY"]:
+            url = "https://api.unsplash.com/search/photos"
+            params = {"query": q, "per_page": 1, "content_filter": "high"}
+            headers = {"Authorization": f"Client-ID {st.secrets['UNSPLASH_KEY']}"}
+            r = requests.get(url, params=params, headers=headers, timeout=8)
+            if r.ok:
+                js = r.json()
+                if js.get("results"):
+                    src = js["results"][0]["urls"]["regular"]
+                    img = requests.get(src, timeout=8)
+                    if img.ok and img.content:
+                        return img.content
+    except Exception:
+        pass
+    # 3) Wikimedia fallback
+    try:
+        url = CUISINE_IMAGES.get(query_cuisine.lower().strip(), PLACEHOLDER)
+        img = requests.get(url, timeout=8)
+        if img.ok and img.content:
+            return img.content
+    except Exception:
+        pass
     return None
 
-# -------------------- Nutrition per 100 g --------------------
+# ---------- nutrition per 100 g ----------
 NUTR_TABLE = {
     "chicken":{"kcal":165,"protein":31.0,"fat":3.6,"carbs":0.0},
     "beef":{"kcal":217,"protein":26.1,"fat":11.8,"carbs":0.0},
@@ -96,20 +128,19 @@ NUTR_TABLE = {
     "yogurt":{"kcal":59,"protein":10.0,"fat":0.4,"carbs":3.6},
 }
 
-# -------------------- Cache: model & labels ------------------
-@st.cache_resource(show_spinner="Loading model pipeline...")
+# ---------- cache: model ----------
+@st.cache_resource(show_spinner="Loading model pipeline…")
 def load_pipeline():
     if not MODEL_PATH.exists():
         st.error(f"Missing model at {MODEL_PATH}"); st.stop()
     if not LABELS_PATH.exists():
         st.error(f"Missing labels at {LABELS_PATH}"); st.stop()
     pipe = joblib.load(MODEL_PATH)
-    labels_raw = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
-    inv = {i: n for i, n in enumerate(labels_raw)} if isinstance(labels_raw, list) \
-         else {int(k): v for k, v in labels_raw.items()}
+    labels = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
+    inv = {i: n for i, n in enumerate(labels)} if isinstance(labels, list) else {int(k): v for k, v in labels.items()}
     return pipe, inv
 
-# -------------------- Helpers -------------------------------
+# ---------- helpers ----------
 def parse_ingredients(text: str) -> List[str]:
     raw = [t.strip() for t in text.replace("\n", ",").split(",")]
     return [t for t in raw if t]
@@ -121,8 +152,7 @@ def parse_mass_g(s: str, default: float = 100.0) -> float:
 def estimate_nutrition(items: List[str], default_mass_g: float = 100.0) -> Dict[str,float]:
     tot = {"kcal":0.0,"protein":0.0,"fat":0.0,"carbs":0.0}
     for it in items:
-        it_l = it.lower()
-        grams = parse_mass_g(it_l, default_mass_g)
+        it_l = it.lower(); grams = parse_mass_g(it_l, default_mass_g)
         for key, nt in NUTR_TABLE.items():
             if key in it_l:
                 mult = grams/100.0
@@ -170,7 +200,7 @@ def dietary_tags(ings: List[str]) -> List[str]:
 def food_value_score(n: Dict[str,float]) -> float:
     return float(np.clip(0.35*n["protein_index"] + 0.40*n["healthiness"] - 0.25*n["caloric_density"], 0.0, 1.0))
 
-# -------------------- Recipe generation --------------------
+# ---------- recipe generation ----------
 FLAIR = {
     "indian":"Finish with garam masala and fresh cilantro.",
     "chinese":"Add a 1–1 splash of soy sauce and rice vinegar; sesame oil off-heat.",
@@ -194,7 +224,7 @@ def generate_recipe(cuisine: str, ings: List[str]) -> str:
     steps.append(FLAIR.get(cuisine.lower(), "Finish with fresh herbs and a drizzle of good olive oil."))
     return f"{title}\n\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
 
-# -------------------- Conversational podcast ----------------
+# ---------- conversational podcast ----------
 EDGE_FEMALE_CHOICES = ["en-US-JennyNeural","en-GB-LibbyNeural","en-AU-NatashaNeural","en-CA-ClaraNeural"]
 EDGE_MALE_CHOICES   = ["en-US-GuyNeural","en-GB-RyanNeural","en-AU-WilliamNeural","en-IN-PrabhatNeural"]
 
@@ -257,26 +287,24 @@ def build_podcast_dialogue(host_name: str, chef_name: str, cuisine: str, ings: L
     hcal  = nutr["calorie_band"]; pidx = f"{nutr['protein_index']:.2f}"; hidx = f"{nutr['healthiness']:.2f}"
     return [
         ("HOST", f"Hello everyone, I'm {host_name}, and welcome back to Flavor Talks!"),
-        ("HOST", f"Today we have Chef {chef_name} with us — a fresh voice in modern {cuisine.title()} cuisine."),
-        ("CHEF", f"Hi {host_name}, thanks for having me. Excited to dig into today’s basket!"),
-        ("HOST", f"Before we cook, give us a short history of {cuisine.title()} cuisine."),
-        ("CHEF", f"{cuisine.title()} cooking celebrates balance and regional staples. Even with {', '.join(ings)}, you can taste that heritage."),
-        ("HOST", "What’s the heartbeat of the dish we’re building today?"),
-        ("CHEF", "Gentle heat, blooming aromatics, and letting each ingredient speak. That’s where flavor lives."),
-        ("HOST", "Quick nutrition snapshot for our listeners?"),
-        ("CHEF", f"Calorie density {hcal}; protein index {pidx}; healthiness {hidx}. Dietary notes: {ttags}."),
-        ("HOST", "One pro tip before we start?"),
-        ("CHEF", "Taste and adjust at the end — tiny acid and fresh herbs make the dish pop."),
-        ("HOST", "Alright Chef, walk us through it."),
-        ("CHEF", "Let’s cook! Warm the pan, bloom aromatics low and slow, then build core flavors…"),
+        ("HOST", f"Today we have Chef {chef_name} with us—bringing {cuisine.title()} flavors."),
+        ("CHEF", f"Hi {host_name}, thanks for having me. Let’s dive into the basket: {', '.join(ings)}."),
+        ("HOST", f"Before we cook, what defines {cuisine.title()} cuisine in a nutshell?"),
+        ("CHEF", f"Balance and regional staples. Even this simple set shows that heritage."),
+        ("HOST", "Quick nutrition snapshot?"),
+        ("CHEF", f"Calorie density {hcal}; protein {pidx}; healthiness {hidx}. Tags: {ttags}."),
+        ("HOST", "One pro tip?"),
+        ("CHEF", "Bloom aromatics gently and finish with acid + herbs."),
+        ("HOST", "Great—walk us through the cooking."),
+        ("CHEF", "Warm the pan, bloom aromatics, build the core flavors, adjust, and serve."),
     ]
 
-# -------------------- UI -------------------------------
+# ---------- UI ----------
 st.set_page_config(page_title=TITLE, page_icon="🍽️", layout="wide")
 st.title(TITLE)
 st.caption("Cuisine prediction • three recipe options • calories/macros • selectable voices • conversational podcast")
 
-# Sidebar controls
+# Sidebar
 st.sidebar.header("Audio Settings")
 st.sidebar.markdown(f"- Edge TTS available: **{'Yes' if EDGE_OK else 'No (fallback to gTTS)'}**")
 st.sidebar.markdown(f"- Single MP3 stitch: **{'Yes' if PYDUB_OK else 'No (install ffmpeg)'}**")
@@ -297,17 +325,20 @@ podcast_pause     = st.sidebar.slider("Pause between turns (ms)", 150, 800, 300,
 host_name         = st.sidebar.text_input("Host display name", value="Sara", key="host_name_in")
 chef_name         = st.sidebar.text_input("Chef display name", value="Masoud", key="chef_name_in")
 
-with st.sidebar.expander("About the model", expanded=False):
-    st.markdown("- Logistic Regression over TF–IDF features\n- Trained on the Yummly ‘What’s Cooking?’ dataset")
+with st.sidebar.expander("Image API setup", expanded=False):
+    st.markdown(
+        "- **Bing**: add `BING_KEY` in *Settings → Secrets* (Azure Cognitive Services ▶️ Bing Image Search).\n"
+        "- **Unsplash**: add `UNSPLASH_KEY` in *Settings → Secrets* (Developer API key).\n"
+        "- If neither is set, app uses curated Wikimedia photos."
+    )
 
-# Load model/labels
+# Load model
 pipe, INV = load_pipeline()
 st.sidebar.markdown(f"- Classes: **{len(INV)}**")
 
-# -------------------- Layout --------------------------
+# Layout
 left, right = st.columns([1.25, 1.0], vertical_alignment="top")
 
-# Input
 with left:
     st.subheader("Ingredients")
     demo = "chicken, soy sauce, ginger, garlic, sesame oil"
@@ -319,8 +350,7 @@ with left:
                     use_container_width=True, key="predict_btn")
     if run:
         if not ings:
-            st.warning("Please provide at least one ingredient.")
-            st.stop()
+            st.warning("Please provide at least one ingredient."); st.stop()
 
         cuisines, probs = predict_topk(pipe, INV, ings, k=TOPK)
         df_pred = pd.DataFrame({"cuisine": cuisines, "probability": probs})
@@ -337,10 +367,9 @@ with left:
         st.session_state["df_pred"]         = df_pred
         st.session_state["cuisines"]        = cuisines
         st.session_state["options_meta"]    = options_meta
-        st.session_state["selected_cuisine"]= cuisines[0]    # default = top-1
+        st.session_state["selected_cuisine"]= cuisines[0]
         st.rerun()
 
-# Render
 with left:
     if st.session_state.get("pred_ready", False):
         df_pred      = st.session_state["df_pred"]
@@ -357,24 +386,19 @@ with left:
                                xaxis=dict(title="Cuisine"), height=300, template="simple_white")
         st.plotly_chart(fig_pred, use_container_width=True, config={"displayModeBar": False}, key="pred_chart")
 
-        # ------- Single source of truth: radio selection -------
+        # Single source of truth
         st.markdown("### Explore three recipe options")
-        chosen = st.radio(
-            "Pick one to preview & voice:",
-            options=cuisines,
-            index=cuisines.index(selected),
-            horizontal=True,
-            label_visibility="collapsed",
-            key="recipe_radio",
-        )
+        chosen = st.radio("Pick one to preview & voice:", options=cuisines,
+                          index=cuisines.index(selected), horizontal=True,
+                          label_visibility="collapsed", key="recipe_radio")
         if chosen != selected:
             st.session_state["selected_cuisine"] = chosen
             selected = chosen
 
-        # ------- Preview for the selected recipe only ----------
+        # Preview
         c = selected
         st.markdown(f"**Cuisine:** {c.title()}")
-        img = get_cuisine_image_bytes(c)
+        img = fetch_image_bytes(c)
         if img:
             st.image(img, use_column_width=True)
         else:
@@ -385,9 +409,9 @@ with left:
 
         # Macro chart
         m = options_meta[c]["macro"]
-        macro_names = ["Calories (kcal)", "Protein (g)", "Fat (g)", "Carbs (g)"]
-        macro_vals  = [m["kcal"], m["protein"], m["fat"], m["carbs"]]
-        fig_macro = go.Figure(data=[go.Bar(x=macro_names, y=macro_vals,
+        names = ["Calories (kcal)", "Protein (g)", "Fat (g)", "Carbs (g)"]
+        vals  = [m["kcal"], m["protein"], m["fat"], m["carbs"]]
+        fig_macro = go.Figure(data=[go.Bar(x=names, y=vals,
                                            marker_color=["#3E7CB1", "#66C2A5", "#FC8D62", "#8DA0CB"])])
         fig_macro.update_layout(margin=dict(l=0, r=0, t=10, b=0),
                                 yaxis=dict(title="Amount", rangemode="tozero"),
@@ -396,27 +420,25 @@ with left:
 
         # Value chart
         n = options_meta[c]["nutr"]
-        value_names = ["Caloric density", "Protein index", "Healthiness", "Food Value Score"]
-        value_vals  = [n["caloric_density"], n["protein_index"], n["healthiness"], options_meta[c]["fvs"]]
-        fig_val = go.Figure(data=[go.Bar(x=value_names, y=value_vals,
+        vnames = ["Caloric density", "Protein index", "Healthiness", "Food Value Score"]
+        vvals  = [n["caloric_density"], n["protein_index"], n["healthiness"], options_meta[c]["fvs"]]
+        fig_val = go.Figure(data=[go.Bar(x=vnames, y=vvals,
                                          marker_color=["#A6CEE3", "#1F78B4", "#33A02C", "#FB9A99"])])
         fig_val.update_yaxes(range=[0, 1])
         fig_val.update_layout(margin=dict(l=0, r=0, t=10, b=0),
-                              yaxis=dict(title="Score (0–1)", rangemode="tozero"),
-                              xaxis=dict(title=""), height=300, template="simple_white")
+                              yaxis=dict(title="Score (0–1)"), xaxis=dict(title=""),
+                              height=300, template="simple_white")
         st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False}, key=f"value_{c}")
 
-        # ---------------- Voice ----------------
+        # Voice
         if enable_recipe_tts:
             st.markdown("#### 🔊 Voice recipe")
             audio = tts_bytes_any(options_meta[c]["recipe"], role="HOST", voice_name=host_voice,
                                   rate=voice_rate, pitch=voice_pitch)
-            if audio:
-                st.audio(audio, format="audio/mp3")
-            else:
-                st.info("TTS unavailable in this environment (Edge blocked and/or gTTS missing).")
+            if audio: st.audio(audio, format="audio/mp3")
+            else:     st.info("TTS unavailable in this environment (Edge blocked and/or gTTS missing).")
 
-        # ---------------- Podcast ----------------
+        # Podcast
         if enable_podcast:
             st.markdown("#### 🎙️ Conversational podcast (Host ↔ Chef)")
             dlg = build_podcast_dialogue(host_name, chef_name, c, ings, n, dietary_tags(ings))
@@ -444,7 +466,8 @@ with right:
         "1) Enter ingredients\n\n"
         "2) Click **Predict cuisines & build 3 recipe options**\n\n"
         "3) Use the **radio** to pick the cuisine — everything syncs to that\n\n"
-        "4) Turn on **Voice** and/or **Podcast** in the sidebar and choose voices"
+        "4) For images, add **BING_KEY** or **UNSPLASH_KEY** in *Settings → Secrets* to fetch fresh photos\n\n"
+        "5) Turn on **Voice**/**Podcast** and choose voices in the sidebar"
     )
 
 st.markdown("---")
