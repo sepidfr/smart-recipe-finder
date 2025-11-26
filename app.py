@@ -1,8 +1,19 @@
-# app.py — Smart Recipe Finder (state-synced selection → recipe/voice/podcast)
+# app.py — Smart Recipe Finder (full, professional, English)
+# ----------------------------------------------------------
+# - TF–IDF + Logistic Regression (joblib pipeline)
+# - Predict TOP-3 cuisines → show 3 recipe options (distinct cuisines, with fallback)
+# - One selection drives: preview, charts, single-voice TTS, and a HOST↔CHEF podcast
+# - Robust TTS: Edge TTS (male/female real voices) → gTTS fallback (accents via TLD)
+# - Safe asyncio handling for Edge TTS; optional MP3 stitch via PyDub + ffmpeg
+# - Unsplash image fallback; download buttons for podcast MP3 and recipe text
+
 from __future__ import annotations
-import io, json, re, asyncio
+import io
+import re
+import json
+import asyncio
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -10,7 +21,7 @@ import joblib
 import streamlit as st
 import plotly.graph_objects as go
 
-# -------------------- Optional audio deps --------------------
+# ─────────────────────────── Optional audio deps ───────────────────────────────
 def _has_edge_tts() -> bool:
     try:
         import edge_tts  # noqa: F401
@@ -18,7 +29,7 @@ def _has_edge_tts() -> bool:
     except Exception:
         return False
 
-def _has_pydub() -> bool:
+def _has_pydub_ffmpeg() -> bool:
     try:
         from pydub import AudioSegment  # noqa: F401
         return True
@@ -26,9 +37,9 @@ def _has_pydub() -> bool:
         return False
 
 EDGE_OK  = _has_edge_tts()
-PYDUB_OK = _has_pydub()
+PYDUB_OK = _has_pydub_ffmpeg()
 
-# -------------------- Paths / constants ----------------------
+# ─────────────────────────── Paths / constants ─────────────────────────────────
 APP_DIR     = Path(__file__).resolve().parent
 MODEL_PATH  = APP_DIR / "cuisine_pipeline.joblib"
 LABELS_PATH = APP_DIR / "labels.json"
@@ -37,7 +48,7 @@ TITLE = "Smart Recipe Finder"
 TOPK  = 3
 np.random.seed(42)
 
-# -------------------- Nutrition per 100 g --------------------
+# ─────────────────────── Nutrition per 100 g (simple table) ───────────────────
 NUTR_TABLE = {
     "chicken":{"kcal":165,"protein":31.0,"fat":3.6,"carbs":0.0},
     "beef":{"kcal":217,"protein":26.1,"fat":11.8,"carbs":0.0},
@@ -60,25 +71,29 @@ NUTR_TABLE = {
     "yogurt":{"kcal":59,"protein":10.0,"fat":0.4,"carbs":3.6},
 }
 
-# -------------------- Cache: model & labels ------------------
+# ───────────────────────────── Cache: model & labels ───────────────────────────
 @st.cache_resource(show_spinner="Loading model pipeline...")
 def load_pipeline():
     if not MODEL_PATH.exists():
-        st.error(f"Missing model at {MODEL_PATH}"); st.stop()
+        st.error(f"Missing model at {MODEL_PATH}. Upload your TF–IDF+LogReg joblib file.")
+        st.stop()
     if not LABELS_PATH.exists():
-        st.error(f"Missing labels at {LABELS_PATH}"); st.stop()
+        st.error(f"Missing labels at {LABELS_PATH}. Provide a JSON list or {idx: name} mapping.")
+        st.stop()
     pipe = joblib.load(MODEL_PATH)
     labels_raw = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
     inv = {i: n for i, n in enumerate(labels_raw)} if isinstance(labels_raw, list) \
          else {int(k): v for k, v in labels_raw.items()}
     return pipe, inv
 
-# -------------------- Helpers -------------------------------
+# ──────────────────────────────── Helpers ─────────────────────────────────────
 def cuisine_image_url(cuisine: str) -> str:
-    return f"https://source.unsplash.com/800x500/?{(cuisine+' plated dish').replace(' ','%20')}"
+    # Unsplash random image by query; fallback is handled by Streamlit automatically if unreachable
+    q = (cuisine + " plated dish").replace(" ", "%20")
+    return f"https://source.unsplash.com/800x500/?{q}"
 
 def parse_ingredients(text: str) -> List[str]:
-    raw = [t.strip() for t in text.replace("\n", ",").split(",")]
+    raw = [t.strip() for t in text.replace("؛", ",").replace("\n", ",").split(",")]
     return [t for t in raw if t]
 
 def parse_mass_g(s: str, default: float = 100.0) -> float:
@@ -100,25 +115,16 @@ def estimate_nutrition(items: List[str], default_mass_g: float = 100.0) -> Dict[
                 break
     return tot
 
-def predict_topk(pipe, inv_labels, ings: List[str], k: int = TOPK):
-    text = " ".join(ings)
-    proba = pipe.predict_proba([text])[0]
-    order = np.argsort(proba)[::-1][:k]
-    names = [inv_labels[i] for i in order]
-    values = proba[order]
-    return names, values
-
 def qualitative_nutrition(ings: List[str]) -> Dict[str, float | str]:
     s = " ".join(ings).lower()
     hi_cal = sum(w in s for w in ["butter","oil","olive oil","ghee","cream","cheese","sugar","fried","bacon","nuts","peanut","sesame oil"])
     protein = sum(w in s for w in ["chicken","beef","pork","fish","tuna","egg","tofu","lentil","bean","chickpea","yogurt","paneer"])
     greens = sum(w in s for w in ["spinach","kale","broccoli","herb","parsley","cilantro","tomato","cucumber","lettuce","carrot","zucchini","pepper"])
-    c_score = min(1.0, 0.20*hi_cal + 0.15*len(ings))
-    p_score = min(1.0, 0.12*protein + 0.02*len(ings))
-    h_score = min(1.0, 0.10*greens + 0.02*(len(ings)-hi_cal))
+    c_score = float(np.clip(0.20*hi_cal + 0.15*len(ings), 0.0, 1.0))
+    p_score = float(np.clip(0.12*protein + 0.02*len(ings), 0.0, 1.0))
+    h_score = float(np.clip(0.10*greens + 0.02*(len(ings)-hi_cal), 0.0, 1.0))
     cal_band = "low" if c_score <= 0.33 else ("medium" if c_score <= 0.66 else "high")
-    return {"caloric_density":float(c_score),"protein_index":float(p_score),
-            "healthiness":float(h_score),"calorie_band":cal_band}
+    return {"caloric_density":c_score,"protein_index":p_score,"healthiness":h_score,"calorie_band":cal_band}
 
 def dietary_tags(ings: List[str]) -> List[str]:
     s = " ".join(ings).lower()
@@ -131,13 +137,13 @@ def dietary_tags(ings: List[str]) -> List[str]:
     if not gluten: tags.append("gluten-light")
     if "pork" not in s and "bacon" not in s and "ham" not in s: tags.append("pork-free")
     if not any(w in s for w in ["wine","beer","ale","vodka","rum","whiskey","brandy"]): tags.append("no-alcohol")
-    if any(w in s for w in ["chili","chilli","jalapeno","cayenne","gochujang","harissa","pepper flakes"]): tags.append("spicy")
+    if any(w in s for w in ["chili","chilli","jalapeno","cayenne","gochujang","harissa","pepper flakes","hot","spicy"]): tags.append("spicy")
     return tags[:4]
 
 def food_value_score(n: Dict[str,float]) -> float:
     return float(np.clip(0.35*n["protein_index"] + 0.40*n["healthiness"] - 0.25*n["caloric_density"], 0.0, 1.0))
 
-# -------------------- Recipe generation --------------------
+# ───────────────────────── Recipe generation (deterministic) ──────────────────
 FLAIR = {
     "indian":"Finish with garam masala and fresh cilantro.",
     "chinese":"Add a 1–1 splash of soy sauce and rice vinegar; sesame oil off-heat.",
@@ -148,22 +154,60 @@ FLAIR = {
     "french":"Mount with a small knob of butter; finish with parsley/chives.",
     "thai":"Balance sweet–sour–salty with palm sugar, lime, fish sauce."
 }
-def generate_recipe(cuisine: str, ings: List[str]) -> str:
-    title = f"{cuisine.title()} Style Dish with {', '.join(ings[:3]).title() if ings else 'Seasonal Ingredients'}"
-    steps = [
-        "Finely chop aromatics (garlic/ginger/onion) and measure spices.",
-        "Season main ingredients with salt and pepper.",
-        "Heat oil; bloom spices and aromatics until fragrant.",
-        "Add main ingredients, sear lightly, then cook through.",
-        "Adjust with acid (lemon/lime/vinegar) and fresh herbs.",
-        "Taste, correct seasoning, and serve warm."
-    ]
-    steps.append(FLAIR.get(cuisine.lower(), "Finish with fresh herbs and a drizzle of good olive oil."))
-    return f"{title}\n\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
 
-# -------------------- Conversational podcast ----------------
+def _best_3(ings: List[str]) -> str:
+    # Compact ingredient phrase for titles
+    base = ", ".join([i.strip() for i in ings if i.strip()][:3])
+    return base if base else "Seasonal Ingredients"
+
+def generate_recipe(cuisine: str, ings: List[str]) -> str:
+    title = f"{cuisine.title()}-Style Dish with {_best_3(ings).title()}"
+    # A fuller, step-by-step script that later can be read inside the podcast
+    steps = [
+        "Set up: wash and dry produce. Finely chop garlic, ginger, and onion; measure spices.",
+        "Season mains lightly with salt and black pepper; keep at room temperature 10 minutes.",
+        "Pan on medium heat. Add oil; bloom aromatics 60–90 seconds until fragrant (no browning).",
+        "Add mains; sear 2–3 minutes to develop light color, then reduce heat to medium-low.",
+        "Layer flavor: add core spices and a splash of stock or water. Simmer until tender.",
+        "Adjust: a touch of acid (lemon/lime/vinegar) and fresh herbs for brightness.",
+        "Rest 2 minutes; plate and finish with a drizzle of good oil or fresh herbs."
+    ]
+    steps.append(FLAIR.get(cuisine.lower(), "Finish with fresh herbs and a drizzle of olive oil."))
+    body = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+    return f"{title}\n\n{body}"
+
+# ─────────────────────────── Prediction (robust TOP-3) ────────────────────────
+def predict_topk(pipe, inv_labels: Dict[int,str], ings: List[str], k: int = TOPK) -> Tuple[List[str], np.ndarray]:
+    text = " ".join(ings)
+    proba = pipe.predict_proba([text])[0]
+    order = np.argsort(proba)[::-1]
+    names, values, seen = [], [], set()
+    for idx in order:
+        c = inv_labels[idx]
+        if c not in seen:
+            names.append(c); values.append(proba[idx]); seen.add(c)
+        if len(names) == k:
+            break
+    # Fallback, ensure distinct k classes even if model is uncertain
+    if len(names) < k:
+        FALLBACK = ["italian","mexican","indian","chinese","french","japanese","thai","korean","spanish","greek"]
+        for c in FALLBACK:
+            if len(names) == k: break
+            if c not in seen:
+                names.append(c); values.append(0.0); seen.add(c)
+    return names, np.array(values, dtype=float)
+
+# ─────────────────────────────── TTS Utilities ────────────────────────────────
 EDGE_FEMALE_CHOICES = ["en-US-JennyNeural","en-GB-LibbyNeural","en-AU-NatashaNeural","en-CA-ClaraNeural"]
 EDGE_MALE_CHOICES   = ["en-US-GuyNeural","en-GB-RyanNeural","en-AU-WilliamNeural","en-IN-PrabhatNeural"]
+
+GTTs_ACCENTS = {
+    "US": "com",
+    "UK": "co.uk",
+    "AU": "com.au",
+    "CA": "ca",
+    "IN": "co.in",
+}
 
 def _ssml_wrap_chat(text: str, rate: str = "+0%", pitch: str = "+0%") -> str:
     safe = (text or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
@@ -182,79 +226,157 @@ async def _edge_ssml_to_bytes_async(ssml: str, voice: str) -> bytes:
             buf.write(chunk["data"])
     return buf.getvalue()
 
-def tts_bytes_any(text: str, role: str, voice_name: str | None, rate: str = "+0%", pitch: str = "+0%") -> bytes | None:
-    if voice_name and EDGE_OK:
+def _run_async(coro):
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Run on a dedicated loop to avoid "event loop already running"
+            new_loop = asyncio.new_event_loop()
+            try:
+                return new_loop.run_until_complete(coro)
+            finally:
+                new_loop.close()
+        else:
+            return loop.run_until_complete(coro)
+    except RuntimeError:
+        # No loop at all
+        return asyncio.run(coro)
+
+def tts_bytes_any(
+    text: str,
+    role: str,
+    edge_voice_name: Optional[str],
+    rate: str = "+0%",
+    pitch: str = "+0%",
+    gtts_tld: str = "com",
+) -> Optional[bytes]:
+    # Try Edge first if a voice name is provided and Edge is available
+    if edge_voice_name and EDGE_OK:
         try:
             ssml = _ssml_wrap_chat(text, rate=rate, pitch=pitch)
-            return asyncio.run(_edge_ssml_to_bytes_async(ssml, voice_name))
+            return _run_async(_edge_ssml_to_bytes_async(ssml, edge_voice_name))
         except Exception:
-            pass
+            pass  # fall back to gTTS below
+
+    # gTTS fallback (not truly gendered, but accent differs by TLD)
     try:
         from gtts import gTTS
-        tld = "co.uk" if role == "HOST" else "com.au"
-        tts = gTTS(text=text, lang="en", tld=tld)
-        out = io.BytesIO(); tts.write_to_fp(out)
+        tts = gTTS(text=text, lang="en", tld=gtts_tld)
+        out = io.BytesIO()
+        tts.write_to_fp(out)
         return out.getvalue()
     except Exception:
         return None
 
-def stitch_dialogue(dialogue: List[Tuple[str,str]], host_voice: str | None, chef_voice: str | None,
-                    pause_ms: int = 300, rate: str = "+0%", pitch: str = "+0%") -> bytes | None:
+def stitch_dialogue(
+    dialogue: List[Tuple[str,str]],
+    host_voice: Optional[str],
+    chef_voice: Optional[str],
+    pause_ms: int = 250,
+    rate: str = "+0%",
+    pitch: str = "+0%",
+    tld_host: str = "com",
+    tld_chef: str = "com"
+) -> Optional[bytes]:
     if not PYDUB_OK:
         return None
     try:
         from pydub import AudioSegment
-        track = AudioSegment.silent(duration=50)
+        track = AudioSegment.silent(duration=60)
         gap   = AudioSegment.silent(duration=max(0, int(pause_ms)))
         for role, text in dialogue:
             voice = host_voice if role == "HOST" else chef_voice
-            b = tts_bytes_any(text, role, voice, rate=rate, pitch=pitch)
+            tld   = tld_host if role == "HOST" else tld_chef
+            b = tts_bytes_any(text, role, voice, rate=rate, pitch=pitch, gtts_tld=tld)
             if not b:
                 return None
             seg = AudioSegment.from_file(io.BytesIO(b), format="mp3")
             track += seg + gap
-        out = io.BytesIO(); track.export(out, format="mp3")
+        out = io.BytesIO()
+        track.export(out, format="mp3")
         return out.getvalue()
     except Exception:
         return None
 
-def build_podcast_dialogue(host_name: str, chef_name: str, cuisine: str, ings: List[str],
-                           nutr: Dict[str,float], tags: List[str]) -> List[Tuple[str,str]]:
+# ───────────────────────────── Podcast (dialogue) ─────────────────────────────
+def _clean_recipe_lines(recipe_text: str) -> List[str]:
+    # Extract lines that look like steps; keep both "1. ..." and plain lines
+    lines = [ln.strip() for ln in recipe_text.split("\n") if ln.strip()]
+    # Remove title line
+    if lines and "-Style Dish" in lines[0]:
+        lines = lines[1:]
+    # Keep lines that are either numbered or sentences
+    cleaned = []
+    for ln in lines:
+        # strip leading numbering "1. " etc.
+        cleaned.append(re.sub(r"^\d+\.\s*", "", ln))
+    return cleaned
+
+def build_podcast_dialogue(
+    host_name: str,
+    chef_name: str,
+    cuisine: str,
+    ings: List[str],
+    nutr: Dict[str,float|str],
+    tags: List[str],
+    recipe_text: str
+) -> List[Tuple[str,str]]:
+    base = ", ".join(ings[:2]) if ings else "basic pantry items"
     ttags = ", ".join(tags) if tags else "balanced"
-    hcal  = nutr["calorie_band"]; pidx = f"{nutr['protein_index']:.2f}"; hidx = f"{nutr['healthiness']:.2f}"
-    return [
-        ("HOST", f"Hello everyone, I'm {host_name}, and welcome back to Flavor Talks!"),
-        ("HOST", f"Today we have Chef {chef_name} with us — a fresh voice in modern {cuisine.title()} cuisine."),
-        ("CHEF", f"Hi {host_name}, thanks for having me. Excited to dig into today’s basket!"),
-        ("HOST", f"Before we cook, give us a short history of {cuisine.title()} cuisine."),
-        ("CHEF", f"{cuisine.title()} cooking celebrates balance and regional staples. Even with {', '.join(ings)}, you can taste that heritage."),
-        ("HOST", "What’s the heartbeat of the dish we’re building today?"),
-        ("CHEF", "Gentle heat, blooming aromatics, and letting each ingredient speak. That’s where flavor lives."),
-        ("HOST", "Quick nutrition snapshot for our listeners?"),
-        ("CHEF", f"Calorie density {hcal}; protein index {pidx}; healthiness {hidx}. Dietary notes: {ttags}."),
-        ("HOST", "One pro tip before we start?"),
-        ("CHEF", "Taste and adjust at the end — tiny acid and fresh herbs make the dish pop."),
-        ("HOST", "Alright Chef, walk us through it."),
-        ("CHEF", "Let’s cook! Warm the pan, bloom aromatics low and slow, then build core flavors…"),
+    hcal  = nutr["calorie_band"]; pidx = f"{float(nutr['protein_index']):.2f}"; hidx = f"{float(nutr['healthiness']):.2f}"
+
+    # Conversational intro
+    dlg: List[Tuple[str,str]] = [
+        ("HOST", f"Hello everyone — {host_name} here, and welcome back to Flavor Talks!"),
+        ("HOST", f"Today I'm joined by Chef {chef_name}, bringing modern {cuisine.title()} flavors."),
+        ("CHEF", f"Hi {host_name}, thanks for having me. I love this basket — {base} gives us options."),
+        ("HOST", f"In one breath, what defines {cuisine.title()} cuisine to you?"),
+        ("CHEF", f"It’s heritage meeting balance. Even with {base}, you can feel its regional backbone."),
+        ("HOST", "Give us a quick nutrition postcard for the dish we’ll build."),
+        ("CHEF", f"Calorie density {hcal}; protein index {pidx}; healthiness {hidx}. Tags: {ttags}."),
+        ("HOST", "Great — now walk us through the actual step-by-step. Keep it crisp."),
     ]
 
-# -------------------- UI -------------------------------
+    # Insert recipe steps as chef speech
+    steps = _clean_recipe_lines(recipe_text)
+    step_no = 1
+    for ln in steps:
+        if not ln: 
+            continue
+        dlg.append(("CHEF", f"Step {step_no}: {ln}"))
+        step_no += 1
+
+    # Close
+    dlg.extend([
+        ("HOST", "Beautiful — fast, clear, and packed with flavor."),
+        ("CHEF", "Thanks! Tiny acid and fresh herbs at the end — that’s the glow."),
+    ])
+    return dlg
+
+# ───────────────────────────────── UI ─────────────────────────────────────────
 st.set_page_config(page_title=TITLE, page_icon="🍽️", layout="wide")
 st.title(TITLE)
 st.caption("Cuisine prediction • three recipe options • calories/macros • selectable voices • conversational podcast")
 
-# Sidebar controls
+# Sidebar: audio config
 st.sidebar.header("Audio Settings")
 st.sidebar.markdown(f"- Edge TTS available: **{'Yes' if EDGE_OK else 'No (fallback to gTTS)'}**")
-st.sidebar.markdown(f"- Single MP3 stitch: **{'Yes' if PYDUB_OK else 'No (install ffmpeg)'}**")
+st.sidebar.markdown(f"- MP3 stitch (PyDub/ffmpeg): **{'Yes' if PYDUB_OK else 'No'}**")
 
-host_voice = EDGE_FEMALE_CHOICES[0] if EDGE_OK else None
-chef_voice = EDGE_MALE_CHOICES[0]   if EDGE_OK else None
+# Voice pickers
 if EDGE_OK:
     host_voice = st.sidebar.selectbox("Host voice (female)", EDGE_FEMALE_CHOICES, index=0, key="host_voice_sel")
     chef_voice = st.sidebar.selectbox("Chef voice (male)",   EDGE_MALE_CHOICES,   index=0, key="chef_voice_sel")
+    tld_host = "com"; tld_chef = "com"  # Irrelevant when Edge is on, kept for API completeness
 else:
-    st.sidebar.info("Edge voices unavailable: using gTTS fallback (not truly gendered).")
+    st.sidebar.info("Edge voices not available — using gTTS accents (not truly gendered).")
+    host_voice = None
+    chef_voice = None
+    # Let user choose accents to simulate voice difference
+    host_acc = st.sidebar.selectbox("Host accent (gTTS)", list(GTTs_ACCENTS.keys()), index=1, key="host_acc")
+    chef_acc = st.sidebar.selectbox("Chef accent (gTTS)", list(GTTs_ACCENTS.keys()), index=0, key="chef_acc")
+    tld_host = GTTs_ACCENTS[host_acc]
+    tld_chef = GTTs_ACCENTS[chef_acc]
 
 voice_rate        = st.sidebar.selectbox("Voice speed", ["-10%","-5%","+0%","+5%","+10%"], index=2, key="rate_sel")
 voice_pitch       = st.sidebar.selectbox("Voice pitch", ["-2%","+0%","+2%","+4%"], index=1, key="pitch_sel")
@@ -271,19 +393,23 @@ with st.sidebar.expander("About the model", expanded=False):
 pipe, INV = load_pipeline()
 st.sidebar.markdown(f"- Classes: **{len(INV)}**")
 
-# -------------------- Layout --------------------------
-left, right = st.columns([1.25, 1.0], vertical_alignment="top")
+# ─────────────────────────────── Layout ───────────────────────────────────────
+left, right = st.columns([1.25, 1.0])
 
 # Input
 with left:
     st.subheader("Ingredients")
     demo = "chicken, soy sauce, ginger, garlic, sesame oil"
-    ing_text = st.text_area("Comma-separated or one per line", value=demo, height=120,
-                            placeholder="e.g., tomato, basil, garlic, olive oil", key="ing_text")
+    ing_text = st.text_area(
+        "Comma-separated or one per line",
+        value=demo,
+        height=120,
+        placeholder="e.g., tomato, basil, garlic, olive oil",
+        key="ing_text"
+    )
     ings = parse_ingredients(ing_text)
 
-    run = st.button("Predict cuisines & build 3 recipe options", type="primary",
-                    use_container_width=True, key="predict_btn")
+    run = st.button("Predict cuisines & build 3 recipe options", type="primary", use_container_width=True, key="predict_btn")
     if run:
         if not ings:
             st.warning("Please provide at least one ingredient.")
@@ -300,11 +426,11 @@ with left:
             fvs    = food_value_score(nutr)
             options_meta[c] = {"recipe": recipe, "macro": macro, "nutr": nutr, "fvs": fvs}
 
-        st.session_state["pred_ready"]      = True
-        st.session_state["df_pred"]         = df_pred
-        st.session_state["cuisines"]        = cuisines
-        st.session_state["options_meta"]    = options_meta
-        st.session_state["selected_cuisine"]= cuisines[0]    # default = top-1
+        st.session_state["pred_ready"]       = True
+        st.session_state["df_pred"]          = df_pred
+        st.session_state["cuisines"]         = cuisines
+        st.session_state["options_meta"]     = options_meta
+        st.session_state["selected_cuisine"] = cuisines[0]    # default = top-1
         st.rerun()
 
 # Render
@@ -317,14 +443,13 @@ with left:
 
         # Top predictions chart
         st.markdown("### Top predictions")
-        fig_pred = go.Figure(data=[go.Bar(x=df_pred["cuisine"], y=df_pred["probability"],
-                                          marker_color=["#4C78A8", "#F58518", "#54A24B"])])
+        fig_pred = go.Figure(data=[go.Bar(x=df_pred["cuisine"], y=df_pred["probability"])])
         fig_pred.update_layout(margin=dict(l=0, r=0, t=10, b=0),
-                               yaxis=dict(title="Proba", rangemode="tozero"),
+                               yaxis=dict(title="Probability", rangemode="tozero"),
                                xaxis=dict(title="Cuisine"), height=300, template="simple_white")
         st.plotly_chart(fig_pred, use_container_width=True, config={"displayModeBar": False}, key="pred_chart")
 
-        # ------- Single source of truth: radio selection -------
+        # Single source of truth: radio drives the rest
         st.markdown("### Explore three recipe options")
         chosen = st.radio(
             "Pick one to preview & voice:",
@@ -338,19 +463,18 @@ with left:
             st.session_state["selected_cuisine"] = chosen
             selected = chosen
 
-        # ------- Preview for the selected recipe only ----------
+        # Preview for the selected recipe only
         c = selected
         st.markdown(f"**Cuisine:** {c.title()}")
         st.image(cuisine_image_url(c), use_column_width=True)
-        st.text_area("Recipe", value=options_meta[c]["recipe"], height=220,
-                     label_visibility="collapsed", key=f"recipe_preview_{c}")
+        recipe_text = options_meta[c]["recipe"]
+        st.text_area("Recipe", value=recipe_text, height=260, label_visibility="collapsed", key=f"recipe_preview_{c}")
 
         # Macro chart
         m = options_meta[c]["macro"]
         macro_names = ["Calories (kcal)", "Protein (g)", "Fat (g)", "Carbs (g)"]
         macro_vals  = [m["kcal"], m["protein"], m["fat"], m["carbs"]]
-        fig_macro = go.Figure(data=[go.Bar(x=macro_names, y=macro_vals,
-                                           marker_color=["#3E7CB1", "#66C2A5", "#FC8D62", "#8DA0CB"])])
+        fig_macro = go.Figure(data=[go.Bar(x=macro_names, y=macro_vals)])
         fig_macro.update_layout(margin=dict(l=0, r=0, t=10, b=0),
                                 yaxis=dict(title="Amount", rangemode="tozero"),
                                 xaxis=dict(title=""), height=300, template="simple_white")
@@ -360,39 +484,48 @@ with left:
         n = options_meta[c]["nutr"]
         value_names = ["Caloric density", "Protein index", "Healthiness", "Food Value Score"]
         value_vals  = [n["caloric_density"], n["protein_index"], n["healthiness"], options_meta[c]["fvs"]]
-        fig_val = go.Figure(data=[go.Bar(x=value_names, y=value_vals,
-                                         marker_color=["#A6CEE3", "#1F78B4", "#33A02C", "#FB9A99"])])
+        fig_val = go.Figure(data=[go.Bar(x=value_names, y=value_vals)])
         fig_val.update_yaxes(range=[0, 1])
         fig_val.update_layout(margin=dict(l=0, r=0, t=10, b=0),
                               yaxis=dict(title="Score (0–1)", rangemode="tozero"),
                               xaxis=dict(title=""), height=300, template="simple_white")
         st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False}, key=f"value_{c}")
 
-        # ---------------- Voice ----------------
+        # Voice: single-file recipe TTS (host voice)
         if enable_recipe_tts:
             st.markdown("#### 🔊 Voice recipe")
-            audio = tts_bytes_any(options_meta[c]["recipe"], role="HOST", voice_name=host_voice,
-                                  rate=voice_rate, pitch=voice_pitch)
+            tld_for_host = tld_host if not EDGE_OK else "com"
+            audio = tts_bytes_any(recipe_text, role="HOST", edge_voice_name=host_voice,
+                                  rate=voice_rate, pitch=voice_pitch, gtts_tld=tld_for_host)
             if audio:
-                st.audio(audio, format="audio/mp3")   # no key
+                st.audio(audio, format="audio/mp3")
+                st.download_button("Download recipe MP3", data=audio,
+                                   file_name=f"{c}_recipe.mp3", mime="audio/mpeg", key=f"dl_recipe_{c}")
             else:
                 st.info("TTS unavailable in this environment (Edge blocked and/or gTTS missing).")
 
-        # ---------------- Podcast ----------------
+        # Podcast: conversational, includes REAL step-by-step recipe
         if enable_podcast:
             st.markdown("#### 🎙️ Conversational podcast (Host ↔ Chef)")
-            dlg = build_podcast_dialogue(host_name, chef_name, c, ings, n, dietary_tags(ings))
+            dlg = build_podcast_dialogue(host_name, chef_name, c, ings, n, dietary_tags(ings), recipe_text)
             st.markdown("\n".join([f"**{r}:** {t}" for r, t in dlg]))
 
-            stitched = stitch_dialogue(dlg, host_voice, chef_voice, pause_ms=int(podcast_pause),
-                                       rate=voice_rate, pitch=voice_pitch)
+            stitched = stitch_dialogue(
+                dlg, host_voice, chef_voice,
+                pause_ms=int(podcast_pause), rate=voice_rate, pitch=voice_pitch,
+                tld_host=tld_host, tld_chef=tld_chef
+            )
             if stitched:
-                st.audio(stitched, format="audio/mp3")  # no key
+                st.audio(stitched, format="audio/mp3")
+                st.download_button("Download podcast MP3", data=stitched,
+                                   file_name=f"{c}_podcast.mp3", mime="audio/mpeg", key=f"dl_podcast_{c}")
             else:
-                st.caption("Playing per-turn (single-file stitch unavailable).")
+                st.caption("Single-file stitch unavailable — playing turn-by-turn.")
+                # Turn-by-turn playback
                 for i, (role, text) in enumerate(dlg, 1):
                     vname = host_voice if role == "HOST" else chef_voice
-                    b = tts_bytes_any(text, role, vname, rate=voice_rate, pitch=voice_pitch)
+                    tld   = tld_host if role == "HOST" else tld_chef
+                    b = tts_bytes_any(text, role, vname, rate=voice_rate, pitch=voice_pitch, gtts_tld=tld)
                     if b:
                         st.markdown(f"*Turn {i} — {role}*")
                         st.audio(b, format="audio/mp3")
@@ -405,8 +538,17 @@ with right:
     st.markdown(
         "1) Enter ingredients\n\n"
         "2) Click **Predict cuisines & build 3 recipe options**\n\n"
-        "3) Use the **radio** to pick the cuisine — everything syncs to that\n\n"
-        "4) Turn on **Voice** and/or **Podcast** in the sidebar and choose voices"
+        "3) Use the **radio** to pick one of the three cuisines (selection syncs everywhere)\n\n"
+        "4) Turn on **Voice** and/or **Podcast** in the sidebar and set voices\n\n"
+        "5) Download the MP3 files if you like"
+    )
+
+    st.markdown("---")
+    st.subheader("Notes")
+    st.markdown(
+        "- Ensure you provide **cuisine_pipeline.joblib** and **labels.json** in the app folder.\n"
+        "- For real female/male voices, Edge TTS must be available. Otherwise, gTTS accents are used.\n"
+        "- MP3 stitching requires **pydub** and **ffmpeg** to be installed in the environment."
     )
 
 st.markdown("---")
