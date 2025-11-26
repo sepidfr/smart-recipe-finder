@@ -1,9 +1,10 @@
-streamlit
+streamlit==1.39.0
 scikit-learn
-joblib
 pandas
 numpy
+joblib
+requests
 plotly
-edge-tts
 gTTS
 pydub
+edge-tts
