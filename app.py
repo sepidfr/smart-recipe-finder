@@ -1,6 +1,8 @@
-# app.py — Smart Recipe Finder (state-synced selection → recipe/voice/podcast)
+# app.py — Smart Recipe Finder
+# Top-k cuisine prediction • 3 recipe options • calories/macros • selectable voices • conversational podcast
+
 from __future__ import annotations
-import io, json, re, asyncio
+import io, json, re, asyncio, requests
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -36,6 +38,40 @@ LABELS_PATH = APP_DIR / "labels.json"
 TITLE = "Smart Recipe Finder"
 TOPK  = 3
 np.random.seed(42)
+
+# -------------------- Stable cuisine images -----------------
+CUISINE_IMAGES = {
+    "chinese":   "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/Cuisine_of_China.jpg/800px-Cuisine_of_China.jpg",
+    "korean":    "https://upload.wikimedia.org/wikipedia/commons/thumb/0/05/Korean_cuisine-Kimchi.jpg/800px-Korean_cuisine-Kimchi.jpg",
+    "japanese":  "https://upload.wikimedia.org/wikipedia/commons/thumb/6/60/Sushi_platter.jpg/800px-Sushi_platter.jpg",
+    "italian":   "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a3/Meal_Pizza.jpg/800px-Meal_Pizza.jpg",
+    "indian":    "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/Indian_cuisine.jpg/800px-Indian_cuisine.jpg",
+    "mexican":   "https://upload.wikimedia.org/wikipedia/commons/thumb/1/10/Tacos_de_carnitas.jpg/800px-Tacos_de_carnitas.jpg",
+    "french":    "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/French_cuisine_-_duck_confit.jpg/800px-French_cuisine_-_duck_confit.jpg",
+    "thai":      "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0c/Pad_Thai_kung_Chang_Khien_street_stall.jpg/800px-Pad_Thai_kung_Chang_Khien_street_stall.jpg",
+    "greek":     "https://upload.wikimedia.org/wikipedia/commons/thumb/8/81/Greek_meze.jpg/800px-Greek_meze.jpg",
+    "spanish":   "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6a/Paella_mixta_01.jpg/800px-Paella_mixta_01.jpg",
+    "british":   "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9a/Fish_and_chips_blackpool.jpg/800px-Fish_and_chips_blackpool.jpg",
+    "brazilian": "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2e/Feijoada.jpg/800px-Feijoada.jpg",
+    "russian":   "https://upload.wikimedia.org/wikipedia/commons/thumb/7/77/Borscht_served.jpg/800px-Borscht_served.jpg",
+    "moroccan":  "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2c/Tajine_Zitoune.jpg/800px-Tajine_Zitoune.jpg",
+    "vietnamese":"https://upload.wikimedia.org/wikipedia/commons/thumb/5/5a/Ph%E1%BB%9F_in_Saigon.jpg/800px-Ph%E1%BB%9F_in_Saigon.jpg",
+}
+PLACEHOLDER_PNG = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ac/No_image_available.svg/512px-No_image_available.svg.png"
+
+def get_cuisine_image_bytes(cuisine: str) -> bytes | None:
+    key = (cuisine or "").lower().strip()
+    urls = [CUISINE_IMAGES.get(key, ""), PLACEHOLDER_PNG]
+    for url in urls:
+        if not url:
+            continue
+        try:
+            r = requests.get(url, timeout=8)
+            if r.ok and r.content:
+                return r.content
+        except Exception:
+            continue
+    return None
 
 # -------------------- Nutrition per 100 g --------------------
 NUTR_TABLE = {
@@ -74,9 +110,6 @@ def load_pipeline():
     return pipe, inv
 
 # -------------------- Helpers -------------------------------
-def cuisine_image_url(cuisine: str) -> str:
-    return f"https://source.unsplash.com/800x500/?{(cuisine+' plated dish').replace(' ','%20')}"
-
 def parse_ingredients(text: str) -> List[str]:
     raw = [t.strip() for t in text.replace("\n", ",").split(",")]
     return [t for t in raw if t]
@@ -341,7 +374,12 @@ with left:
         # ------- Preview for the selected recipe only ----------
         c = selected
         st.markdown(f"**Cuisine:** {c.title()}")
-        st.image(cuisine_image_url(c), use_column_width=True)
+        img = get_cuisine_image_bytes(c)
+        if img:
+            st.image(img, use_column_width=True)
+        else:
+            st.info("Image unavailable for this cuisine.")
+
         st.text_area("Recipe", value=options_meta[c]["recipe"], height=220,
                      label_visibility="collapsed", key=f"recipe_preview_{c}")
 
@@ -374,7 +412,7 @@ with left:
             audio = tts_bytes_any(options_meta[c]["recipe"], role="HOST", voice_name=host_voice,
                                   rate=voice_rate, pitch=voice_pitch)
             if audio:
-                st.audio(audio, format="audio/mp3")   # no key
+                st.audio(audio, format="audio/mp3")
             else:
                 st.info("TTS unavailable in this environment (Edge blocked and/or gTTS missing).")
 
@@ -387,7 +425,7 @@ with left:
             stitched = stitch_dialogue(dlg, host_voice, chef_voice, pause_ms=int(podcast_pause),
                                        rate=voice_rate, pitch=voice_pitch)
             if stitched:
-                st.audio(stitched, format="audio/mp3")  # no key
+                st.audio(stitched, format="audio/mp3")
             else:
                 st.caption("Playing per-turn (single-file stitch unavailable).")
                 for i, (role, text) in enumerate(dlg, 1):
