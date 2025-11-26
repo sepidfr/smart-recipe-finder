@@ -1,14 +1,9 @@
-# app.py — Smart Recipe Finder (professional)
-# - TF–IDF + Logistic Regression pipeline (joblib)
-# - Predict TOP-3 cuisines → show 3 recipe options
-# - Single selection drives preview, charts, and voice/podcast
-# - Robust images: local assets → Bing/Unsplash (secrets) → Wikimedia → placeholder
-# - Plotly charts; Edge TTS (multi-voice) with gTTS fallback; optional stitched podcast
-
+# app.py — Smart Recipe Finder (professional, fixed audio/image)
 from __future__ import annotations
 import io, re, json, asyncio
 from pathlib import Path
 from typing import Dict, List, Tuple
+from uuid import uuid4
 
 import requests
 import numpy as np
@@ -17,7 +12,7 @@ import joblib
 import streamlit as st
 import plotly.graph_objects as go
 
-# ─────────────────────────── Runtime feature probes ────────────────────────────
+# ───────── feature probes ─────────
 def _has_edge_tts() -> bool:
     try:
         import edge_tts  # noqa: F401
@@ -34,17 +29,16 @@ def _has_pydub() -> bool:
 
 EDGE_OK, PYDUB_OK = _has_edge_tts(), _has_pydub()
 
-# ───────────────────────────── Paths / constants ───────────────────────────────
+# ───────── paths / constants ─────────
 APP_DIR     = Path(__file__).resolve().parent
 MODEL_PATH  = APP_DIR / "cuisine_pipeline.joblib"
 LABELS_PATH = APP_DIR / "labels.json"
-ASSETS_DIR  = (APP_DIR / "assets").resolve()  # put local cuisine images here
+ASSETS_DIR  = (APP_DIR / "assets").resolve()
 
 TITLE = "Smart Recipe Finder"
 TOPK  = 3
 np.random.seed(42)
 
-# Curated Wikimedia fallbacks
 CUISINE_IMAGES = {
     "brazilian":"https://upload.wikimedia.org/wikipedia/commons/thumb/2/2e/Feijoada.jpg/800px-Feijoada.jpg",
     "british":"https://upload.wikimedia.org/wikipedia/commons/thumb/9/9a/Fish_and_chips_blackpool.jpg/800px-Fish_and_chips_blackpool.jpg",
@@ -69,7 +63,7 @@ CUISINE_IMAGES = {
 }
 PLACEHOLDER = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ac/No_image_available.svg/512px-No_image_available.svg.png"
 
-# ───────────────────────────── Image retrieval ────────────────────────────────
+# ───────── image retrieval ─────────
 @st.cache_data(show_spinner=False, ttl=3600)
 def _read_local(fname: str) -> bytes | None:
     try:
@@ -83,7 +77,7 @@ def _read_local(fname: str) -> bytes | None:
     return None
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def _http_bytes(url: str, timeout: int = 8) -> bytes | None:
+def _http_bytes(url: str, timeout: int = 10) -> bytes | None:
     try:
         r = requests.get(url, timeout=timeout)
         if r.ok and r.content and "text/html" not in r.headers.get("Content-Type","").lower():
@@ -95,52 +89,17 @@ def _http_bytes(url: str, timeout: int = 8) -> bytes | None:
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_image_bytes(cuisine: str) -> bytes | None:
     key = (cuisine or "").strip().lower()
-
-    # 1) Local assets (recommended: assets/<cuisine>.jpg|png|webp)
     for ext in (".jpg",".jpeg",".png",".webp"):
         b = _read_local(key + ext)
         if b:
             return b
-
-    # 2) Bing Image Search (if secret set)
-    try:
-        if "BING_KEY" in st.secrets and st.secrets["BING_KEY"]:
-            q = f"{key} cuisine plated dish"
-            url = "https://api.bing.microsoft.com/v7.0/images/search"
-            params = {"q": q, "imageType":"Photo", "safeSearch":"Moderate", "count":1, "license":"Public"}
-            headers = {"Ocp-Apim-Subscription-Key": st.secrets["BING_KEY"]}
-            js = requests.get(url, params=params, headers=headers, timeout=8).json()
-            if js.get("value"):
-                src = js["value"][0].get("contentUrl") or js["value"][0].get("thumbnailUrl")
-                b = _http_bytes(src)
-                if b: return b
-    except Exception:
-        pass
-
-    # 3) Unsplash (if secret set)
-    try:
-        if "UNSPLASH_KEY" in st.secrets and st.secrets["UNSPLASH_KEY"]:
-            q = f"{key} cuisine plated dish"
-            api = "https://api.unsplash.com/search/photos"
-            headers = {"Authorization": f"Client-ID {st.secrets['UNSPLASH_KEY']}"}
-            js = requests.get(api, params={"query": q, "per_page":1}, headers=headers, timeout=8).json()
-            if js.get("results"):
-                src = js["results"][0]["urls"]["regular"]
-                b = _http_bytes(src)
-                if b: return b
-    except Exception:
-        pass
-
-    # 4) Wikimedia curated fallback
     url = CUISINE_IMAGES.get(key)
     if url:
         b = _http_bytes(url)
         if b: return b
-
-    # 5) Placeholder (guaranteed)
     return _http_bytes(PLACEHOLDER)
 
-# ─────────────────────────── Nutrition & heuristics ────────────────────────────
+# ───────── nutrition / heuristics ─────────
 NUTR_TABLE = {
     "chicken":{"kcal":165,"protein":31.0,"fat":3.6,"carbs":0.0},
     "beef":{"kcal":217,"protein":26.1,"fat":11.8,"carbs":0.0},
@@ -215,7 +174,7 @@ def dietary_tags(ings: List[str]) -> List[str]:
 def food_value_score(n: Dict[str,float]) -> float:
     return float(np.clip(0.35*n["protein_index"] + 0.40*n["healthiness"] - 0.25*n["caloric_density"], 0.0, 1.0))
 
-# ───────────────────────────── Model loading ───────────────────────────────────
+# ───────── model ─────────
 @st.cache_resource(show_spinner="Loading model pipeline…")
 def load_pipeline():
     if not MODEL_PATH.exists():
@@ -235,7 +194,7 @@ def predict_topk(pipe, inv_labels, ings: List[str], k: int = TOPK):
     values = proba[order]
     return names, values
 
-# ───────────────────────────── Recipes / Podcast ───────────────────────────────
+# ───────── recipes / podcast / tts ─────────
 FLAIR = {
     "indian":"Finish with garam masala and fresh cilantro.",
     "chinese":"Add a 1–1 splash of soy sauce and rice vinegar; sesame oil off-heat.",
@@ -279,14 +238,15 @@ async def _edge_async(ssml: str, voice: str) -> bytes:
             buf.write(chunk["data"])
     return buf.getvalue()
 
+def _is_audio_bytes(x) -> bool:
+    return isinstance(x, (bytes, bytearray)) and len(x) > 32
+
 def tts_bytes_any(text: str, role: str, voice: str | None, rate: str = "+0%", pitch: str = "+0%") -> bytes | None:
-    # Try Edge SSML (gendered)
     if voice and EDGE_OK:
         try:
             return asyncio.run(_edge_async(_ssml_chat(text, rate, pitch), voice))
         except Exception:
             pass
-    # Fallback: gTTS (single voice)
     try:
         from gtts import gTTS
         tld = "co.uk" if role == "HOST" else "com.au"
@@ -307,7 +267,8 @@ def stitch_dialogue(dialogue: List[Tuple[str,str]], host_voice: str | None, chef
         for role, text in dialogue:
             v = host_voice if role == "HOST" else chef_voice
             b = tts_bytes_any(text, role, v, rate=rate, pitch=pitch)
-            if not b: return None
+            if not _is_audio_bytes(b): 
+                return None
             seg = AudioSegment.from_file(io.BytesIO(b), format="mp3")
             track += seg + gap
         out = io.BytesIO(); track.export(out, format="mp3")
@@ -332,12 +293,11 @@ def build_podcast_dialogue(host_name: str, chef_name: str, cuisine: str, ings: L
         ("CHEF", "Warm the pan, bloom aromatics, build core flavors, adjust, and serve."),
     ]
 
-# ─────────────────────────────────── UI ────────────────────────────────────────
+# ───────── UI ─────────
 st.set_page_config(page_title=TITLE, page_icon="🍽️", layout="wide")
 st.title(TITLE)
 st.caption("Cuisine prediction • three recipe options • calories/macros • selectable voices • conversational podcast")
 
-# Sidebar: audio + info
 st.sidebar.header("Audio Settings")
 st.sidebar.markdown(f"- Edge TTS available: **{'Yes' if EDGE_OK else 'No (fallback to gTTS)'}**")
 st.sidebar.markdown(f"- Single MP3 stitch: **{'Yes' if PYDUB_OK else 'No (install ffmpeg)'}**")
@@ -360,15 +320,13 @@ chef_name         = st.sidebar.text_input("Chef display name", value="Masoud", k
 
 with st.sidebar.expander("Image setup", expanded=False):
     st.markdown(
-        "- **Preferred:** add local images to `assets/` named `<cuisine>.jpg` (lowercase).\n"
-        "- Or set secrets: `BING_KEY` (Bing Image Search), `UNSPLASH_KEY` (Unsplash API).\n"
-        "- App falls back to curated Wikimedia URLs, then a placeholder."
+        "- Preferred: add images into `assets/` named `<cuisine>.jpg` (lowercase).\n"
+        "- App also has curated Wikimedia fallbacks; otherwise a small placeholder is shown."
     )
 
 pipe, INV = load_pipeline()
 st.sidebar.markdown(f"- Classes: **{len(INV)}**")
 
-# Layout
 left, right = st.columns([1.25, 1.0], vertical_alignment="top")
 
 with left:
@@ -409,7 +367,6 @@ with left:
         options_meta = st.session_state["options_meta"]
         selected     = st.session_state.get("selected_cuisine", cuisines[0])
 
-        # Top predictions
         st.markdown("### Top predictions")
         fig_pred = go.Figure(data=[go.Bar(x=df_pred["cuisine"], y=df_pred["probability"],
                                           marker_color=["#4C78A8", "#F58518", "#54A24B"])])
@@ -418,7 +375,6 @@ with left:
                                xaxis=dict(title="Cuisine"), height=300, template="simple_white")
         st.plotly_chart(fig_pred, use_container_width=True, config={"displayModeBar": False}, key="pred_chart")
 
-        # Single source of truth: radio
         st.markdown("### Explore three recipe options")
         chosen = st.radio("Pick one to preview & voice:", options=cuisines,
                           index=cuisines.index(selected), horizontal=True,
@@ -430,18 +386,18 @@ with left:
         c = selected
         st.markdown(f"**Cuisine:** {c.title()}")
 
-        # Image
+        # image (bounded width)
         img = fetch_image_bytes(c)
         if img:
-            st.image(img, use_column_width=True)
+            st.image(img, width=680)
         else:
             st.info("Image unavailable for this cuisine.")
 
-        # Recipe text
+        # recipe text
         st.text_area("Recipe", value=options_meta[c]["recipe"], height=220,
                      label_visibility="collapsed", key=f"recipe_preview_{c}")
 
-        # Macros chart
+        # macros chart
         m = options_meta[c]["macro"]
         names = ["Calories (kcal)", "Protein (g)", "Fat (g)", "Carbs (g)"]
         vals  = [m["kcal"], m["protein"], m["fat"], m["carbs"]]
@@ -452,7 +408,7 @@ with left:
                                 xaxis=dict(title=""), height=300, template="simple_white")
         st.plotly_chart(fig_macro, use_container_width=True, config={"displayModeBar": False}, key=f"macro_{c}")
 
-        # Value chart
+        # value chart
         n = options_meta[c]["nutr"]
         vnames = ["Caloric density", "Protein index", "Healthiness", "Food Value Score"]
         vvals  = [n["caloric_density"], n["protein_index"], n["healthiness"], options_meta[c]["fvs"]]
@@ -464,15 +420,18 @@ with left:
                               height=300, template="simple_white")
         st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False}, key=f"value_{c}")
 
-        # Voice
+        # voice recipe (strict bytes + unique key)
         if enable_recipe_tts:
             st.markdown("#### 🔊 Voice recipe")
             audio = tts_bytes_any(options_meta[c]["recipe"], role="HOST", voice=host_voice,
                                   rate=voice_rate, pitch=voice_pitch)
-            if audio: st.audio(audio, format="audio/mp3", key=f"audio_recipe_{c}")
-            else:     st.info("TTS unavailable in this environment.")
+            if _is_audio_bytes(audio):
+                st.audio(io.BytesIO(audio), format="audio/mp3",
+                         start_time=0, key=f"audio_recipe_{c}_{uuid4().hex}")
+            else:
+                st.info("TTS unavailable in this environment.")
 
-        # Podcast
+        # podcast
         if enable_podcast:
             st.markdown("#### 🎙️ Conversational podcast (Host ↔ Chef)")
             tags = dietary_tags(ings)
@@ -481,18 +440,20 @@ with left:
 
             stitched = stitch_dialogue(dlg, host_voice, chef_voice, pause_ms=int(podcast_pause),
                                        rate=voice_rate, pitch=voice_pitch)
-            if stitched:
-                st.audio(stitched, format="audio/mp3", key=f"podcast_{c}")
+            if _is_audio_bytes(stitched):
+                st.audio(io.BytesIO(stitched), format="audio/mp3",
+                         key=f"podcast_{c}_{uuid4().hex}")
             else:
                 st.caption("Per-turn playback:")
                 for i, (role, text) in enumerate(dlg, 1):
                     vname = host_voice if role == "HOST" else chef_voice
                     b = tts_bytes_any(text, role, vname, rate=voice_rate, pitch=voice_pitch)
-                    if not b:
+                    if not _is_audio_bytes(b):
                         st.info("TTS unavailable in this environment.")
                         break
                     st.markdown(f"*Turn {i} — {role}*")
-                    st.audio(b, format="audio/mp3", key=f"turn_{i}_{c}")
+                    st.audio(io.BytesIO(b), format="audio/mp3",
+                             key=f"turn_{i}_{c}_{uuid4().hex}")
 
 with right:
     st.subheader("How to use")
@@ -500,7 +461,7 @@ with right:
         "1) Enter ingredients\n\n"
         "2) Click **Predict cuisines & build 3 recipe options**\n\n"
         "3) Use the **radio** to pick one — preview, charts, voice & podcast all sync\n\n"
-        "4) For images, add local files to `assets/` or set `BING_KEY` / `UNSPLASH_KEY` in secrets\n\n"
+        "4) For images, add local files to `assets/` or rely on curated fallbacks\n\n"
         "5) Enable **Voice** or **Podcast** and choose voices in the sidebar"
     )
 
