@@ -1,15 +1,10 @@
-# app.py — Smart Recipe Finder (images fixed with Wikimedia thumbnails)
-# - TF–IDF + Logistic Regression (joblib)
-# - Predict TOP-3 cuisines → 3 recipe options (radio drives everything)
-# - Nutrition (kcal/macros) + qualitative scores + Food Value Score
-# - Plotly charts
-# - Images: assets/<cuisine>.jpg → Bing/Unsplash (if secrets) → Wikimedia thumb.php → placeholder
-# - Voice: Edge TTS (multi-voice) with gTTS fallback; optional stitched podcast (pydub)
+# app.py — Smart Recipe Finder (stable audio keys + clamped images)
 
 from __future__ import annotations
 import io, re, json, asyncio
 from pathlib import Path
 from typing import Dict, List, Tuple
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -17,6 +12,11 @@ import requests
 import joblib
 import streamlit as st
 import plotly.graph_objects as go
+
+# ───────────────────────── helpers: unique keys ─────────────────────────
+def ukey(prefix: str) -> str:
+    """Unique Streamlit element key to avoid DuplicateElementId on reruns."""
+    return f"{prefix}_{uuid4().hex}"
 
 # ─────────────────────────── Capability probes ───────────────────────────
 def _has_edge_tts() -> bool:
@@ -39,13 +39,14 @@ EDGE_OK, PYDUB_OK = _has_edge_tts(), _has_pydub()
 APP_DIR     = Path(__file__).resolve().parent
 MODEL_PATH  = APP_DIR / "cuisine_pipeline.joblib"
 LABELS_PATH = APP_DIR / "labels.json"
-ASSETS_DIR  = (APP_DIR / "assets").resolve()  # add <cuisine>.jpg here for 100% reliable images
+ASSETS_DIR  = (APP_DIR / "assets").resolve()
 
 TITLE = "Smart Recipe Finder"
 TOPK  = 3
+IMG_WIDTH = 680  # clamp image width (prevents huge placeholder)
 np.random.seed(42)
 
-# Wikimedia filenames (not URLs). We will fetch via thumb.php (works behind most proxies/CDNs).
+# Wikimedia file names → we fetch via thumb.php (reliable bytes)
 CUISINE_FILES = {
     "brazilian":"Feijoada.jpg",
     "british":"Fish_and_chips_blackpool.jpg",
@@ -70,8 +71,7 @@ CUISINE_FILES = {
 }
 PLACEHOLDER = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ac/No_image_available.svg/512px-No_image_available.svg.png"
 
-def _wm_thumb_url(filename: str, width: int = 900) -> str:
-    # Wikimedia thumb endpoint reliably returns image bytes
+def _wm_thumb_url(filename: str, width: int = IMG_WIDTH) -> str:
     return f"https://commons.wikimedia.org/w/thumb.php?f={filename}&width={width}"
 
 # ───────────────────────────── Image retrieval ──────────────────────────
@@ -95,7 +95,7 @@ def _http_bytes(url: str, timeout: int = 12) -> bytes | None:
 def fetch_image_bytes(cuisine: str) -> bytes | None:
     key = (cuisine or "").strip().lower()
 
-    # 1) Local assets preferred
+    # 1) Local assets (best)
     for ext in (".jpg", ".jpeg", ".png", ".webp"):
         p = (ASSETS_DIR / (key + ext)).resolve()
         if str(p).startswith(str(ASSETS_DIR)) and p.exists():
@@ -104,7 +104,7 @@ def fetch_image_bytes(cuisine: str) -> bytes | None:
             except Exception:
                 pass
 
-    # 2) Bing Image Search (optional)
+    # 2) Optional: Bing / Unsplash via secrets (kept from previous version)
     try:
         if "BING_KEY" in st.secrets and st.secrets["BING_KEY"]:
             q = f"{key} cuisine plated dish"
@@ -119,7 +119,6 @@ def fetch_image_bytes(cuisine: str) -> bytes | None:
     except Exception:
         pass
 
-    # 3) Unsplash (optional)
     try:
         if "UNSPLASH_KEY" in st.secrets and st.secrets["UNSPLASH_KEY"]:
             q = f"{key} cuisine plated dish"
@@ -133,17 +132,16 @@ def fetch_image_bytes(cuisine: str) -> bytes | None:
     except Exception:
         pass
 
-    # 4) Wikimedia thumbnail (solid fallback)
+    # 3) Wikimedia thumbnail (solid, constrained by IMG_WIDTH)
     fname = CUISINE_FILES.get(key)
     if fname:
-        b = _http_bytes(_wm_thumb_url(fname, 900))
+        b = _http_bytes(_wm_thumb_url(fname, IMG_WIDTH))
         if not b:
-            # Try a smaller width if CDN throttles
-            b = _http_bytes(_wm_thumb_url(fname, 640))
+            b = _http_bytes(_wm_thumb_url(fname, 480))
         if b:
             return b
 
-    # 5) Placeholder (guaranteed)
+    # 4) Placeholder (also constrained by width via st.image width=IMG_WIDTH)
     return _http_bytes(PLACEHOLDER)
 
 # ───────────────────────── Nutrition & heuristics ───────────────────────
@@ -341,7 +339,6 @@ st.set_page_config(page_title=TITLE, page_icon="🍽️", layout="wide")
 st.title(TITLE)
 st.caption("Cuisine prediction • three recipe options • calories/macros • selectable voices • conversational podcast")
 
-# Sidebar: audio + info
 st.sidebar.header("Audio Settings")
 st.sidebar.markdown(f"- Edge TTS available: **{'Yes' if EDGE_OK else 'No (fallback to gTTS)**'}")
 st.sidebar.markdown(f"- Single MP3 stitch: **{'Yes' if PYDUB_OK else 'No (install ffmpeg)**'}")
@@ -365,14 +362,13 @@ chef_name         = st.sidebar.text_input("Chef display name", value="Masoud", k
 with st.sidebar.expander("Image setup", expanded=False):
     st.markdown(
         "- **Best:** add local images to `assets/` named `<cuisine>.jpg` (lowercase).\n"
-        "- Or set secrets: `BING_KEY` / `UNSPLASH_KEY`.\n"
-        "- Fallback uses Wikimedia thumbnails (thumb.php); finally a placeholder."
+        "- Optional: `BING_KEY` / `UNSPLASH_KEY` in secrets.\n"
+        "- Fallback uses Wikimedia thumbnails; images are clamped to width."
     )
 
 pipe, INV = load_pipeline()
 st.sidebar.markdown(f"- Classes: **{len(INV)}**")
 
-# Layout
 left, right = st.columns([1.25, 1.0], vertical_alignment="top")
 
 with left:
@@ -413,16 +409,14 @@ with left:
         options_meta = st.session_state["options_meta"]
         selected     = st.session_state.get("selected_cuisine", cuisines[0])
 
-        # Top predictions
         st.markdown("### Top predictions")
         fig_pred = go.Figure(data=[go.Bar(x=df_pred["cuisine"], y=df_pred["probability"],
                                           marker_color=["#4C78A8", "#F58518", "#54A24B"])])
         fig_pred.update_layout(margin=dict(l=0, r=0, t=10, b=0),
                                yaxis=dict(title="Proba", rangemode="tozero"),
                                xaxis=dict(title="Cuisine"), height=300, template="simple_white")
-        st.plotly_chart(fig_pred, use_container_width=True, config={"displayModeBar": False}, key="pred_chart")
+        st.plotly_chart(fig_pred, use_container_width=True, config={"displayModeBar": False}, key=ukey("pred_chart"))
 
-        # Single source of truth: radio
         st.markdown("### Explore three recipe options")
         chosen = st.radio("Pick one to preview & voice:", options=cuisines,
                           index=cuisines.index(selected), horizontal=True,
@@ -434,18 +428,15 @@ with left:
         c = selected
         st.markdown(f"**Cuisine:** {c.title()}")
 
-        # Image (bytes → always renders)
         img = fetch_image_bytes(c)
         if img:
-            st.image(img, use_column_width=True)
+            st.image(img, width=IMG_WIDTH, caption=c.title(), clamp=True, output_format="auto", use_column_width=False)
         else:
-            st.info("Image unavailable for this cuisine.")
+            st.image(PLACEHOLDER, width=IMG_WIDTH, caption="Image unavailable", use_column_width=False)
 
-        # Recipe text (key binds to cuisine so it refreshes properly)
         st.text_area("Recipe", value=options_meta[c]["recipe"], height=220,
-                     label_visibility="collapsed", key=f"recipe_preview_{c}")
+                     label_visibility="collapsed", key=ukey(f"recipe_preview_{c}"))
 
-        # Macros chart
         m = options_meta[c]["macro"]
         names = ["Calories (kcal)", "Protein (g)", "Fat (g)", "Carbs (g)"]
         vals  = [m["kcal"], m["protein"], m["fat"], m["carbs"]]
@@ -454,9 +445,8 @@ with left:
         fig_macro.update_layout(margin=dict(l=0, r=0, t=10, b=0),
                                 yaxis=dict(title="Amount", rangemode="tozero"),
                                 xaxis=dict(title=""), height=300, template="simple_white")
-        st.plotly_chart(fig_macro, use_container_width=True, config={"displayModeBar": False}, key=f"macro_{c}")
+        st.plotly_chart(fig_macro, use_container_width=True, config={"displayModeBar": False}, key=ukey(f"macro_{c}"))
 
-        # Value chart
         n = options_meta[c]["nutr"]
         vnames = ["Caloric density", "Protein index", "Healthiness", "Food Value Score"]
         vvals  = [n["caloric_density"], n["protein_index"], n["healthiness"], options_meta[c]["fvs"]]
@@ -466,17 +456,18 @@ with left:
         fig_val.update_layout(margin=dict(l=0, r=0, t=10, b=0),
                               yaxis=dict(title="Score (0–1)"), xaxis=dict(title=""),
                               height=300, template="simple_white")
-        st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False}, key=f"value_{c}")
+        st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False}, key=ukey(f"value_{c}"))
 
-        # Voice for selected recipe
         if enable_recipe_tts:
             st.markdown("#### 🔊 Voice recipe")
             audio = tts_bytes_any(options_meta[c]["recipe"], role="HOST", voice=host_voice,
                                   rate=voice_rate, pitch=voice_pitch)
-            if audio: st.audio(audio, format="audio/mp3", key=f"audio_recipe_{c}")
-            else:     st.info("TTS unavailable in this environment.")
+            if audio is not None and len(audio) > 0:
+                # unique key prevents DuplicateElementId on reruns
+                st.audio(audio, format="audio/mp3", start_time=0, key=ukey(f"audio_recipe_{c}"))
+            else:
+                st.info("TTS unavailable in this environment.")
 
-        # Conversational podcast (Host ↔ Chef)
         if enable_podcast:
             st.markdown("#### 🎙️ Conversational podcast (Host ↔ Chef)")
             tags = dietary_tags(ings)
@@ -486,7 +477,7 @@ with left:
             stitched = stitch_dialogue(dlg, host_voice, chef_voice, pause_ms=int(podcast_pause),
                                        rate=voice_rate, pitch=voice_pitch)
             if stitched:
-                st.audio(stitched, format="audio/mp3", key=f"podcast_{c}")
+                st.audio(stitched, format="audio/mp3", key=ukey(f"podcast_{c}"))
             else:
                 st.caption("Per-turn playback:")
                 for i, (role, text) in enumerate(dlg, 1):
@@ -496,7 +487,7 @@ with left:
                         st.info("TTS unavailable in this environment.")
                         break
                     st.markdown(f"*Turn {i} — {role}*")
-                    st.audio(b, format="audio/mp3", key=f"turn_{i}_{c}")
+                    st.audio(b, format="audio/mp3", key=ukey(f"turn_{i}_{c}"))
 
 with right:
     st.subheader("How to use")
@@ -504,8 +495,8 @@ with right:
         "1) Enter ingredients\n\n"
         "2) Click **Predict cuisines & build 3 recipe options**\n\n"
         "3) Use the **radio** to pick one — preview, charts, voice & podcast all sync\n\n"
-        "4) For images, add local files to `assets/` or set `BING_KEY` / `UNSPLASH_KEY` (optional)\n\n"
-        "5) Enable **Voice** or **Podcast** and choose voices in the sidebar"
+        "4) For images, prefer local `assets/<cuisine>.jpg` (or set API keys)\n\n"
+        "5) Voices are in the sidebar; audio uses unique keys to stay stable on reruns"
     )
 
 st.markdown("---")
