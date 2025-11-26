@@ -1,4 +1,4 @@
-# app.py — Smart Recipe Finder (PRO) — full Streamlit app
+# app.py — Smart Recipe Finder (PRO, manual Meal Planner) — full Streamlit app
 # ---------------------------------------------------------------------------------
 # Features
 # - TF–IDF + Logistic Regression model (joblib) → predict TOP-3 cuisines (distinct, with fallback)
@@ -7,7 +7,7 @@
 # - MP3 stitch via PyDub + ffmpeg (optional); download buttons for recipe/podcast MP3s
 # - PDF export (recipe card with image + steps + macros) via reportlab (optional fallback)
 # - Auto Shopping List (categorized) + export (TXT/CSV)
-# - Quick Meal Planner (2–7 days) based on the 3 predictions
+# - **Manual Meal Planner**: add/update/delete any day, free-text recipe names, re-order rows, CSV export
 # - Optional translation (Deep-Translator → Google translate) with graceful fallback
 #
 # Suggested requirements.txt (you can omit ones you don’t need):
@@ -46,7 +46,7 @@ import joblib
 import streamlit as st
 import plotly.graph_objects as go
 
-# ============= Optional deps (import lazily and degrade gracefully) =============
+# ==================== Optional deps (import lazily; degrade gracefully) ====================
 def _has_edge_tts() -> bool:
     try:
         import edge_tts  # noqa: F401
@@ -80,7 +80,7 @@ PYDUB_OK  = _has_pydub_ffmpeg()
 PDF_OK    = _has_reportlab()
 TRANS_OK  = _has_deep_translator()
 
-# ============================ Paths / constants ================================
+# ================================= Paths / constants =================================
 APP_DIR     = Path(__file__).resolve().parent
 MODEL_PATH  = APP_DIR / "cuisine_pipeline.joblib"
 LABELS_PATH = APP_DIR / "labels.json"
@@ -89,7 +89,12 @@ TITLE = "Smart Recipe Finder (PRO)"
 TOPK  = 3
 np.random.seed(42)
 
-# ========================== Nutrition per 100 g (simple) =======================
+# ============================ Persistent UI state (meal planner) =========================
+if "meal_plan" not in st.session_state:
+    # Stored as a list of dicts: {"Order": int, "Day": str, "Recipe": str}
+    st.session_state["meal_plan"] = []
+
+# ============================== Nutrition per 100 g (simple) =============================
 NUTR_TABLE = {
     "chicken":{"kcal":165,"protein":31.0,"fat":3.6,"carbs":0.0},
     "beef":{"kcal":217,"protein":26.1,"fat":11.8,"carbs":0.0},
@@ -120,7 +125,7 @@ SHOPPING_CATEGORIES = {
     "spices": ["cumin","chili","chilli","cayenne","turmeric","garam masala","paprika","oregano","thyme","rosemary","pepper flakes"],
 }
 
-# =============================== Cache model/labels ===========================
+# ================================= Cache model/labels =================================
 @st.cache_resource(show_spinner="Loading model pipeline...")
 def load_pipeline():
     if not MODEL_PATH.exists():
@@ -135,7 +140,7 @@ def load_pipeline():
          else {int(k): v for k, v in labels_raw.items()}
     return pipe, inv
 
-# ================================== Helpers ===================================
+# ===================================== Helpers =====================================
 def cuisine_image_url(cuisine: str) -> str:
     q = (cuisine + " plated dish").replace(" ", "%20")
     return f"https://source.unsplash.com/800x500/?{q}"
@@ -191,7 +196,7 @@ def dietary_tags(ings: List[str]) -> List[str]:
 def food_value_score(n: Dict[str,float]) -> float:
     return float(np.clip(0.35*n["protein_index"] + 0.40*n["healthiness"] - 0.25*n["caloric_density"], 0.0, 1.0))
 
-# ============================== Recipes (deterministic) ========================
+# ================================== Recipes (deterministic) ==================================
 FLAIR = {
     "indian":"Finish with garam masala and fresh cilantro.",
     "chinese":"Add a 1–1 splash of soy sauce and rice vinegar; sesame oil off-heat.",
@@ -221,7 +226,7 @@ def generate_recipe(cuisine: str, ings: List[str]) -> str:
     body = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
     return f"{title}\n\n{body}"
 
-# ============================== Prediction (TOP-3 robust) ======================
+# ================================== Prediction (TOP-3 robust) ==================================
 def predict_topk(pipe, inv_labels: Dict[int,str], ings: List[str], k: int = TOPK) -> Tuple[List[str], np.ndarray]:
     text = " ".join(ings)
     proba = pipe.predict_proba([text])[0]
@@ -241,7 +246,7 @@ def predict_topk(pipe, inv_labels: Dict[int,str], ings: List[str], k: int = TOPK
                 names.append(c); values.append(0.0); seen.add(c)
     return names, np.array(values, dtype=float)
 
-# ============================== TTS utilities =================================
+# ================================== TTS utilities ==================================
 EDGE_FEMALE_CHOICES = ["en-US-JennyNeural","en-GB-LibbyNeural","en-AU-NatashaNeural","en-CA-ClaraNeural"]
 EDGE_MALE_CHOICES   = ["en-US-GuyNeural","en-GB-RyanNeural","en-AU-WilliamNeural","en-IN-PrabhatNeural"]
 GTTs_ACCENTS = {"US": "com", "UK": "co.uk", "AU": "com.au", "CA": "ca", "IN": "co.in"}
@@ -330,7 +335,7 @@ def stitch_dialogue(
     except Exception:
         return None
 
-# =============================== Podcast dialogue =============================
+# ================================== Podcast dialogue ==================================
 def _clean_recipe_lines(recipe_text: str) -> List[str]:
     lines = [ln.strip() for ln in recipe_text.split("\n") if ln.strip()]
     if lines and "-Style Dish" in lines[0]:
@@ -358,7 +363,7 @@ def build_podcast_dialogue(
         ("CHEF", f"It’s heritage and balance. Even with {base}, you taste its regional backbone."),
         ("HOST", "Quick nutrition snapshot?"),
         ("CHEF", f"Calorie density {hcal}; protein index {pidx}; healthiness {hidx}. Tags: {ttags}."),
-        ("HOST", "Great — please walk us through the actual recipe. Step by step."),
+        ("HOST", "Great — please walk us through the actual recipe, step by step."),
     ]
     steps = _clean_recipe_lines(recipe_text)
     step_no = 1
@@ -372,7 +377,7 @@ def build_podcast_dialogue(
     ])
     return dlg
 
-# =============================== PDF generation ===============================
+# ================================== PDF generation ==================================
 def generate_recipe_pdf(title: str, ingredients: List[str], recipe_text: str,
                         nutrition: Dict[str, float], image_url: str) -> Optional[bytes]:
     if not PDF_OK:
@@ -438,7 +443,7 @@ def generate_recipe_pdf(title: str, ingredients: List[str], recipe_text: str,
     except Exception:
         return None
 
-# =============================== Translation ==================================
+# ================================== Translation ==================================
 LANG_CODES = {
     "English": "en", "Persian": "fa", "Turkish": "tr", "Arabic": "ar", "French": "fr", "Spanish": "es"
 }
@@ -454,7 +459,7 @@ def translate_text(text: str, target_lang: str) -> str:
     except Exception:
         return text  # graceful fallback
 
-# =============================== Shopping list =================================
+# ================================== Shopping list ==================================
 def categorize_shopping_list(ings: List[str]) -> Dict[str, List[str]]:
     cats: Dict[str, List[str]] = {k: [] for k in SHOPPING_CATEGORIES.keys()}
     cats["other"] = []
@@ -476,7 +481,7 @@ def export_shopping_txt(cats: Dict[str, List[str]]) -> bytes:
     lines = []
     for cat, items in cats.items():
         if not items: continue
-        lines.append(f"[{cat.upper()}]")
+        lines.append(f"[{cat.UPPER()}]" if hasattr(cat, "UPPER") else f"[{cat.upper()}]")
         for it in items:
             lines.append(f"- {it}")
         lines.append("")
@@ -491,18 +496,10 @@ def export_shopping_csv(cats: Dict[str, List[str]]) -> bytes:
             writer.writerow([cat, it])
     return buffer.getvalue().encode("utf-8")
 
-# =============================== Meal Planner =================================
-def build_meal_plan(cuisines: List[str], days: int) -> pd.DataFrame:
-    """Cycle the 3 cuisines over N days."""
-    entries = []
-    for d in range(days):
-        entries.append({"Day": f"Day {d+1}", "Cuisine": cuisines[d % len(cuisines)]})
-    return pd.DataFrame(entries)
-
-# ==================================== UI ======================================
+# ================================== UI ==================================
 st.set_page_config(page_title=TITLE, page_icon="🍽️", layout="wide")
 st.title(TITLE)
-st.caption("Predict cuisines • 3 options • charts • TTS & podcast • PDF • shopping list • planner • translation")
+st.caption("Predict cuisines • 3 options • charts • TTS & podcast • PDF • shopping list • **manual meal planner** • translation")
 
 # Sidebar — Audio
 st.sidebar.header("Audio")
@@ -530,7 +527,7 @@ chef_name         = st.sidebar.text_input("Chef display name", value="Masoud", k
 # Sidebar — Export & Planner
 st.sidebar.header("Export & Planner")
 target_lang_name = st.sidebar.selectbox("Translate to", list(LANG_CODES.keys()), index=0)
-meal_days        = st.sidebar.slider("Meal plan days", 2, 7, 3, key="days_sel")
+meal_days        = st.sidebar.slider("Default day index (for quick pick)", 1, 7, 3, key="days_sel")
 
 with st.sidebar.expander("About the model", expanded=False):
     st.markdown("- Logistic Regression over TF–IDF\n- Trained on Yummly ‘What’s Cooking?’ dataset")
@@ -542,7 +539,7 @@ st.sidebar.markdown(f"- Classes: **{len(INV)}**")
 # Layout
 left, right = st.columns([1.35, 1.0])
 
-# =============================== INPUT PANEL ==================================
+# ================================== INPUT PANEL ==================================
 with left:
     st.subheader("Ingredients")
     demo = "chicken, soy sauce, ginger, garlic, sesame oil"
@@ -579,7 +576,7 @@ with left:
         st.session_state["ings"]             = ings
         st.rerun()
 
-# =============================== RENDER PANEL =================================
+# ================================== RENDER PANEL ==================================
 with left:
     if st.session_state.get("pred_ready", False):
         df_pred      = st.session_state["df_pred"]
@@ -657,19 +654,11 @@ with left:
             else:
                 st.info("TTS unavailable (Edge blocked and/or gTTS missing).")
 
-        # ========================== PODCAST (Dialogue) ========================
+        # ========================== PODCAST (Dialogue) =========================
         if enable_podcast:
             st.markdown("#### 🎙️ Conversational podcast (Host ↔ Chef)")
             dlg_en = build_podcast_dialogue(host_name, chef_name, c, ings, n, dietary_tags(ings), recipe_text)
-
-            # Translate dialogue if needed
-            if tgt_code != "en":
-                dlg = []
-                for role, text in dlg_en:
-                    dlg.append((role, translate_text(text, tgt_code)))
-            else:
-                dlg = dlg_en
-
+            dlg = [(r, translate_text(t, tgt_code)) for (r, t) in dlg_en] if tgt_code != "en" else dlg_en
             st.markdown("\n".join([f"**{r}:** {t}" for r, t in dlg]))
 
             stitched = stitch_dialogue(
@@ -725,10 +714,85 @@ with left:
             st.download_button("Download CSV", data=export_shopping_csv(cats),
                                file_name=f"{c}_shopping_list.csv", mime="text/csv")
 
-        # ========================== MEAL PLANNER ==============================
-        st.markdown("#### 🍽️ Quick meal planner")
-        plan_df = build_meal_plan(cuisines, days=meal_days)
-        st.dataframe(plan_df, use_container_width=True)
+        # ========================== MEAL PLANNER (MANUAL) =============================
+        st.markdown("#### 🍽️ Meal planner (manual)")
+
+        # Day choices (customize if you prefer weekdays)
+        day_choices = [f"Day {i}" for i in range(1, 8)]
+        default_day_index = min(len(day_choices)-1, max(0, meal_days-1))
+
+        col_day, col_recipe, col_custom = st.columns([1, 1, 1.2])
+        with col_day:
+            sel_day = st.selectbox("Select a day", day_choices, index=default_day_index, key="plan_sel_day")
+
+        with col_recipe:
+            sel_recipe_from_pred = st.selectbox("Pick recipe (from predictions)", cuisines, index=0, key="plan_sel_recipe")
+
+        with col_custom:
+            custom_recipe = st.text_input("Or type a custom recipe name", value="", key="plan_custom_recipe")
+
+        final_recipe_name = (custom_recipe.strip() or sel_recipe_from_pred).strip()
+
+        col_add, col_delete, col_clear = st.columns([1,1,1])
+        with col_add:
+            if st.button("Add / Update day", use_container_width=True):
+                found = False
+                for row in st.session_state["meal_plan"]:
+                    if row["Day"] == sel_day:
+                        row["Recipe"] = final_recipe_name
+                        found = True
+                        break
+                if not found:
+                    next_order = (max([r["Order"] for r in st.session_state["meal_plan"]] or [0]) + 1)
+                    st.session_state["meal_plan"].append({"Order": next_order, "Day": sel_day, "Recipe": final_recipe_name})
+
+        with col_delete:
+            if st.button("Delete selected day", use_container_width=True):
+                st.session_state["meal_plan"] = [r for r in st.session_state["meal_plan"] if r["Day"] != sel_day]
+
+        with col_clear:
+            if st.button("Clear all", use_container_width=True):
+                st.session_state["meal_plan"] = []
+
+        if st.session_state["meal_plan"]:
+            plan_df = pd.DataFrame(st.session_state["meal_plan"]).sort_values("Order").reset_index(drop=True)
+            st.caption("Tip: Change the **Order** numbers to re-arrange rows, then click **Apply changes**.")
+            edited_df = st.data_editor(
+                plan_df[["Order","Day","Recipe"]],
+                num_rows="dynamic",
+                use_container_width=True,
+                key="plan_editor",
+            )
+
+            c1, c2 = st.columns([1,1])
+            with c1:
+                if st.button("Apply changes", use_container_width=True):
+                    cleaned = []
+                    for _, row in edited_df.iterrows():
+                        try:
+                            ord_val = int(row["Order"])
+                        except Exception:
+                            continue
+                        day_val = str(row["Day"]).strip()
+                        rec_val = str(row["Recipe"]).strip()
+                        if day_val and rec_val:
+                            cleaned.append({"Order": ord_val, "Day": day_val, "Recipe": rec_val})
+                    dedup = {(r["Order"], r["Day"]): r for r in cleaned}
+                    st.session_state["meal_plan"] = sorted(list(dedup.values()), key=lambda x: x["Order"])
+                    st.success("Meal plan updated.")
+
+            with c2:
+                if st.session_state["meal_plan"]:
+                    export_df = pd.DataFrame(st.session_state["meal_plan"]).sort_values("Order")
+                    st.download_button(
+                        "Download plan CSV",
+                        data=export_df.to_csv(index=False).encode("utf-8"),
+                        file_name="meal_plan.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+        else:
+            st.info("No items yet. Select a day + recipe (or type custom) and click **Add / Update day**.")
 
 # =========================== RIGHT PANE: HOW-TO / NOTES =======================
 with right:
@@ -738,7 +802,8 @@ with right:
         "2) Click **Predict cuisines & build 3 recipe options**\n\n"
         "3) Use the **radio** to pick one cuisine (selection syncs)\n\n"
         "4) Toggle **Voice**/**Podcast**, pick voices, set speed/pitch\n\n"
-        "5) Optionally translate text (sidebar), export **PDF/MP3**, build **shopping list**, and create a **meal plan**"
+        "5) Translate text (sidebar) and export **PDF/MP3**\n\n"
+        "6) Build the **manual meal plan**: choose day, pick/enter recipe, add/update, delete, and re-order; then download CSV"
     )
     st.markdown("---")
     st.subheader("Notes")
@@ -750,4 +815,4 @@ with right:
     )
 
 st.markdown("---")
-st.caption("Smart Recipe Finder (PRO) • cooking coach • shopping helper • meal planner")
+st.caption("Smart Recipe Finder (PRO) • cooking coach • shopping helper • manual meal planner")
