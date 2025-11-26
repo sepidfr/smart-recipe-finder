@@ -1,24 +1,23 @@
-# app.py — Smart Recipe Finder (professional, stable images)
-# - TF–IDF + Logistic Regression (joblib)
-# - Predict TOP-3 cuisines → 3 recipe options (radio drives everything)
-# - Nutrition (kcal/macros) + qualitative scores + Food Value Score
-# - Plotly charts with distinct colors
-# - Robust images: assets/<cuisine>.jpg → Bing/Unsplash (if secrets) → Wikimedia Special:FilePath → placeholder
-# - Voice: Edge TTS (multi-voice) with gTTS fallback; optional stitched podcast (pydub)
+# app.py — Smart Recipe Finder (professional)
+# - TF–IDF + Logistic Regression pipeline (joblib)
+# - Predict TOP-3 cuisines → show 3 recipe options
+# - Single selection drives preview, charts, and voice/podcast
+# - Robust images: local assets → Bing/Unsplash (secrets) → Wikimedia → placeholder
+# - Plotly charts; Edge TTS (multi-voice) with gTTS fallback; optional stitched podcast
 
 from __future__ import annotations
 import io, re, json, asyncio
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import requests
 import numpy as np
 import pandas as pd
-import requests
 import joblib
 import streamlit as st
 import plotly.graph_objects as go
 
-# ─────────────────────────── Capability probes ───────────────────────────
+# ─────────────────────────── Runtime feature probes ────────────────────────────
 def _has_edge_tts() -> bool:
     try:
         import edge_tts  # noqa: F401
@@ -35,53 +34,59 @@ def _has_pydub() -> bool:
 
 EDGE_OK, PYDUB_OK = _has_edge_tts(), _has_pydub()
 
-# ───────────────────────────── Paths / constants ─────────────────────────
+# ───────────────────────────── Paths / constants ───────────────────────────────
 APP_DIR     = Path(__file__).resolve().parent
 MODEL_PATH  = APP_DIR / "cuisine_pipeline.joblib"
 LABELS_PATH = APP_DIR / "labels.json"
-ASSETS_DIR  = (APP_DIR / "assets").resolve()  # add <cuisine>.jpg here for 100% reliable images
+ASSETS_DIR  = (APP_DIR / "assets").resolve()  # put local cuisine images here
 
 TITLE = "Smart Recipe Finder"
 TOPK  = 3
 np.random.seed(42)
 
-# Wikimedia Special:FilePath (returns the binary image reliably)
+# Curated Wikimedia fallbacks
 CUISINE_IMAGES = {
-    "brazilian":"https://commons.wikimedia.org/wiki/Special:FilePath/Feijoada.jpg?width=900",
-    "british":"https://commons.wikimedia.org/wiki/Special:FilePath/Fish_and_chips_blackpool.jpg?width=900",
-    "cajun_creole":"https://commons.wikimedia.org/wiki/Special:FilePath/Cajun_cuisine.jpg?width=900",
-    "chinese":"https://commons.wikimedia.org/wiki/Special:FilePath/Cuisine_of_China.jpg?width=900",
-    "filipino":"https://commons.wikimedia.org/wiki/Special:FilePath/Philippine_cuisine.jpg?width=900",
-    "french":"https://commons.wikimedia.org/wiki/Special:FilePath/French_cuisine_-_duck_confit.jpg?width=900",
-    "greek":"https://commons.wikimedia.org/wiki/Special:FilePath/Greek_meze.jpg?width=900",
-    "indian":"https://commons.wikimedia.org/wiki/Special:FilePath/Indian_cuisine.jpg?width=900",
-    "irish":"https://commons.wikimedia.org/wiki/Special:FilePath/Irish_stew.jpg?width=900",
-    "italian":"https://commons.wikimedia.org/wiki/Special:FilePath/Meal_Pizza.jpg?width=900",
-    "jamaican":"https://commons.wikimedia.org/wiki/Special:FilePath/Jerk_chicken_%28Jamaica%29.jpg?width=900",
-    "japanese":"https://commons.wikimedia.org/wiki/Special:FilePath/Sushi_platter.jpg?width=900",
-    "korean":"https://commons.wikimedia.org/wiki/Special:FilePath/Korean_cuisine-Kimchi.jpg?width=900",
-    "mexican":"https://commons.wikimedia.org/wiki/Special:FilePath/Tacos_de_carnitas.jpg?width=900",
-    "moroccan":"https://commons.wikimedia.org/wiki/Special:FilePath/Tajine_Zitoune.jpg?width=900",
-    "russian":"https://commons.wikimedia.org/wiki/Special:FilePath/Borscht_served.jpg?width=900",
-    "southern_us":"https://commons.wikimedia.org/wiki/Special:FilePath/Southern_US_cuisine.jpg?width=900",
-    "spanish":"https://commons.wikimedia.org/wiki/Special:FilePath/Paella_mixta_01.jpg?width=900",
-    "thai":"https://commons.wikimedia.org/wiki/Special:FilePath/Pad%20Thai%20kung%20Chang%20Khien%20street%20stall.jpg?width=900",
-    "vietnamese":"https://commons.wikimedia.org/wiki/Special:FilePath/Ph%E1%BB%9F_in_Saigon.jpg?width=900",
+    "brazilian":"https://upload.wikimedia.org/wikipedia/commons/thumb/2/2e/Feijoada.jpg/800px-Feijoada.jpg",
+    "british":"https://upload.wikimedia.org/wikipedia/commons/thumb/9/9a/Fish_and_chips_blackpool.jpg/800px-Fish_and_chips_blackpool.jpg",
+    "cajun_creole":"https://upload.wikimedia.org/wikipedia/commons/thumb/4/4d/Cajun_cuisine.jpg/800px-Cajun_cuisine.jpg",
+    "chinese":"https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/Cuisine_of_China.jpg/800px-Cuisine_of_China.jpg",
+    "filipino":"https://upload.wikimedia.org/wikipedia/commons/thumb/2/2a/Philippine_cuisine.jpg/800px-Philippine_cuisine.jpg",
+    "french":"https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/French_cuisine_-_duck_confit.jpg/800px-French_cuisine_-_duck_confit.jpg",
+    "greek":"https://upload.wikimedia.org/wikipedia/commons/thumb/8/81/Greek_meze.jpg/800px-Greek_meze.jpg",
+    "indian":"https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/Indian_cuisine.jpg/800px-Indian_cuisine.jpg",
+    "irish":"https://upload.wikimedia.org/wikipedia/commons/thumb/1/1f/Irish_stew.jpg/800px-Irish_stew.jpg",
+    "italian":"https://upload.wikimedia.org/wikipedia/commons/thumb/a/a3/Meal_Pizza.jpg/800px-Meal_Pizza.jpg",
+    "jamaican":"https://upload.wikimedia.org/wikipedia/commons/thumb/f/f9/Jerk_chicken_%28Jamaica%29.jpg/800px-Jerk_chicken_%28Jamaica%29.jpg",
+    "japanese":"https://upload.wikimedia.org/wikipedia/commons/thumb/6/60/Sushi_platter.jpg/800px-Sushi_platter.jpg",
+    "korean":"https://upload.wikimedia.org/wikipedia/commons/thumb/0/05/Korean_cuisine-Kimchi.jpg/800px-Korean_cuisine-Kimchi.jpg",
+    "mexican":"https://upload.wikimedia.org/wikipedia/commons/thumb/1/10/Tacos_de_carnitas.jpg/800px-Tacos_de_carnitas.jpg",
+    "moroccan":"https://upload.wikimedia.org/wikipedia/commons/thumb/2/2c/Tajine_Zitoune.jpg/800px-Tajine_Zitoune.jpg",
+    "russian":"https://upload.wikimedia.org/wikipedia/commons/thumb/7/77/Borscht_served.jpg/800px-Borscht_served.jpg",
+    "southern_us":"https://upload.wikimedia.org/wikipedia/commons/thumb/1/12/Southern_US_cuisine.jpg/800px-Southern_US_cuisine.jpg",
+    "spanish":"https://upload.wikimedia.org/wikipedia/commons/thumb/6/6a/Paella_mixta_01.jpg/800px-Paella_mixta_01.jpg",
+    "thai":"https://upload.wikimedia.org/wikipedia/commons/thumb/0/0c/Pad_Thai_kung_Chang_Khien_street_stall.jpg/800px-Pad_Thai_kung_Chang_Khien_street_stall.jpg",
+    "vietnamese":"https://upload.wikimedia.org/wikipedia/commons/thumb/5/5a/Ph%E1%BB%9F_in_Saigon.jpg/800px-Ph%E1%BB%9F_in_Saigon.jpg",
 }
 PLACEHOLDER = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ac/No_image_available.svg/512px-No_image_available.svg.png"
 
-# ───────────────────────────── Image retrieval ──────────────────────────
+# ───────────────────────────── Image retrieval ────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=3600)
-def _http_bytes(url: str, timeout: int = 10) -> bytes | None:
+def _read_local(fname: str) -> bytes | None:
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (StreamlitApp; SmartRecipeFinder)",
-            "Accept": "image/*,application/octet-stream;q=0.9,*/*;q=0.8",
-            "Referer": "https://commons.wikimedia.org/",
-        }
-        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        ct = r.headers.get("Content-Type","").lower()
-        if r.ok and r.content and ("image" in ct or "octet-stream" in ct):
+        p = (ASSETS_DIR / fname).resolve()
+        if not str(p).startswith(str(ASSETS_DIR)):
+            return None
+        if p.exists() and p.is_file():
+            return p.read_bytes()
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _http_bytes(url: str, timeout: int = 8) -> bytes | None:
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.ok and r.content and "text/html" not in r.headers.get("Content-Type","").lower():
             return r.content
     except Exception:
         return None
@@ -91,16 +96,13 @@ def _http_bytes(url: str, timeout: int = 10) -> bytes | None:
 def fetch_image_bytes(cuisine: str) -> bytes | None:
     key = (cuisine or "").strip().lower()
 
-    # 1) Local assets preferred
-    for ext in (".jpg", ".jpeg", ".png", ".webp"):
-        p = (ASSETS_DIR / (key + ext)).resolve()
-        if str(p).startswith(str(ASSETS_DIR)) and p.exists():
-            try:
-                return p.read_bytes()
-            except Exception:
-                pass
+    # 1) Local assets (recommended: assets/<cuisine>.jpg|png|webp)
+    for ext in (".jpg",".jpeg",".png",".webp"):
+        b = _read_local(key + ext)
+        if b:
+            return b
 
-    # 2) Bing Image Search (optional)
+    # 2) Bing Image Search (if secret set)
     try:
         if "BING_KEY" in st.secrets and st.secrets["BING_KEY"]:
             q = f"{key} cuisine plated dish"
@@ -115,7 +117,7 @@ def fetch_image_bytes(cuisine: str) -> bytes | None:
     except Exception:
         pass
 
-    # 3) Unsplash (optional)
+    # 3) Unsplash (if secret set)
     try:
         if "UNSPLASH_KEY" in st.secrets and st.secrets["UNSPLASH_KEY"]:
             q = f"{key} cuisine plated dish"
@@ -129,16 +131,16 @@ def fetch_image_bytes(cuisine: str) -> bytes | None:
     except Exception:
         pass
 
-    # 4) Wikimedia Special:FilePath
+    # 4) Wikimedia curated fallback
     url = CUISINE_IMAGES.get(key)
     if url:
         b = _http_bytes(url)
         if b: return b
 
-    # 5) Placeholder
+    # 5) Placeholder (guaranteed)
     return _http_bytes(PLACEHOLDER)
 
-# ───────────────────────── Nutrition & heuristics ───────────────────────
+# ─────────────────────────── Nutrition & heuristics ────────────────────────────
 NUTR_TABLE = {
     "chicken":{"kcal":165,"protein":31.0,"fat":3.6,"carbs":0.0},
     "beef":{"kcal":217,"protein":26.1,"fat":11.8,"carbs":0.0},
@@ -213,7 +215,7 @@ def dietary_tags(ings: List[str]) -> List[str]:
 def food_value_score(n: Dict[str,float]) -> float:
     return float(np.clip(0.35*n["protein_index"] + 0.40*n["healthiness"] - 0.25*n["caloric_density"], 0.0, 1.0))
 
-# ───────────────────────────── Model loading ─────────────────────────────
+# ───────────────────────────── Model loading ───────────────────────────────────
 @st.cache_resource(show_spinner="Loading model pipeline…")
 def load_pipeline():
     if not MODEL_PATH.exists():
@@ -233,7 +235,7 @@ def predict_topk(pipe, inv_labels, ings: List[str], k: int = TOPK):
     values = proba[order]
     return names, values
 
-# ───────────────────────────── Recipes / Podcast ─────────────────────────
+# ───────────────────────────── Recipes / Podcast ───────────────────────────────
 FLAIR = {
     "indian":"Finish with garam masala and fresh cilantro.",
     "chinese":"Add a 1–1 splash of soy sauce and rice vinegar; sesame oil off-heat.",
@@ -278,11 +280,13 @@ async def _edge_async(ssml: str, voice: str) -> bytes:
     return buf.getvalue()
 
 def tts_bytes_any(text: str, role: str, voice: str | None, rate: str = "+0%", pitch: str = "+0%") -> bytes | None:
+    # Try Edge SSML (gendered)
     if voice and EDGE_OK:
         try:
             return asyncio.run(_edge_async(_ssml_chat(text, rate, pitch), voice))
         except Exception:
             pass
+    # Fallback: gTTS (single voice)
     try:
         from gtts import gTTS
         tld = "co.uk" if role == "HOST" else "com.au"
@@ -328,15 +332,15 @@ def build_podcast_dialogue(host_name: str, chef_name: str, cuisine: str, ings: L
         ("CHEF", "Warm the pan, bloom aromatics, build core flavors, adjust, and serve."),
     ]
 
-# ───────────────────────────────── UI ──────────────────────────────────
+# ─────────────────────────────────── UI ────────────────────────────────────────
 st.set_page_config(page_title=TITLE, page_icon="🍽️", layout="wide")
 st.title(TITLE)
 st.caption("Cuisine prediction • three recipe options • calories/macros • selectable voices • conversational podcast")
 
 # Sidebar: audio + info
 st.sidebar.header("Audio Settings")
-st.sidebar.markdown(f"- Edge TTS available: **{'Yes' if EDGE_OK else 'No (fallback to gTTS)**'}")
-st.sidebar.markdown(f"- Single MP3 stitch: **{'Yes' if PYDUB_OK else 'No (install ffmpeg)**'}")
+st.sidebar.markdown(f"- Edge TTS available: **{'Yes' if EDGE_OK else 'No (fallback to gTTS)'}**")
+st.sidebar.markdown(f"- Single MP3 stitch: **{'Yes' if PYDUB_OK else 'No (install ffmpeg)'}**")
 
 host_voice = EDGE_FEMALE_CHOICES[0] if EDGE_OK else None
 chef_voice = EDGE_MALE_CHOICES[0]   if EDGE_OK else None
@@ -356,9 +360,9 @@ chef_name         = st.sidebar.text_input("Chef display name", value="Masoud", k
 
 with st.sidebar.expander("Image setup", expanded=False):
     st.markdown(
-        "- **Best:** add local images to `assets/` named `<cuisine>.jpg` (lowercase).\n"
-        "- Or set secrets: `BING_KEY` / `UNSPLASH_KEY`.\n"
-        "- Fallback: Wikimedia Special:FilePath; finally a placeholder."
+        "- **Preferred:** add local images to `assets/` named `<cuisine>.jpg` (lowercase).\n"
+        "- Or set secrets: `BING_KEY` (Bing Image Search), `UNSPLASH_KEY` (Unsplash API).\n"
+        "- App falls back to curated Wikimedia URLs, then a placeholder."
     )
 
 pipe, INV = load_pipeline()
@@ -405,7 +409,7 @@ with left:
         options_meta = st.session_state["options_meta"]
         selected     = st.session_state.get("selected_cuisine", cuisines[0])
 
-        # Top predictions (unique key)
+        # Top predictions
         st.markdown("### Top predictions")
         fig_pred = go.Figure(data=[go.Bar(x=df_pred["cuisine"], y=df_pred["probability"],
                                           marker_color=["#4C78A8", "#F58518", "#54A24B"])])
@@ -426,18 +430,18 @@ with left:
         c = selected
         st.markdown(f"**Cuisine:** {c.title()}")
 
-        # Image (bytes → always renders)
+        # Image
         img = fetch_image_bytes(c)
         if img:
             st.image(img, use_column_width=True)
         else:
             st.info("Image unavailable for this cuisine.")
 
-        # Recipe text (key binds to cuisine so it refreshes properly)
+        # Recipe text
         st.text_area("Recipe", value=options_meta[c]["recipe"], height=220,
                      label_visibility="collapsed", key=f"recipe_preview_{c}")
 
-        # Macros chart (distinct key per cuisine)
+        # Macros chart
         m = options_meta[c]["macro"]
         names = ["Calories (kcal)", "Protein (g)", "Fat (g)", "Carbs (g)"]
         vals  = [m["kcal"], m["protein"], m["fat"], m["carbs"]]
@@ -460,7 +464,7 @@ with left:
                               height=300, template="simple_white")
         st.plotly_chart(fig_val, use_container_width=True, config={"displayModeBar": False}, key=f"value_{c}")
 
-        # Voice for selected recipe
+        # Voice
         if enable_recipe_tts:
             st.markdown("#### 🔊 Voice recipe")
             audio = tts_bytes_any(options_meta[c]["recipe"], role="HOST", voice=host_voice,
@@ -468,7 +472,7 @@ with left:
             if audio: st.audio(audio, format="audio/mp3", key=f"audio_recipe_{c}")
             else:     st.info("TTS unavailable in this environment.")
 
-        # Conversational podcast (Host ↔ Chef)
+        # Podcast
         if enable_podcast:
             st.markdown("#### 🎙️ Conversational podcast (Host ↔ Chef)")
             tags = dietary_tags(ings)
@@ -496,7 +500,7 @@ with right:
         "1) Enter ingredients\n\n"
         "2) Click **Predict cuisines & build 3 recipe options**\n\n"
         "3) Use the **radio** to pick one — preview, charts, voice & podcast all sync\n\n"
-        "4) For images, add local files to `assets/` or set `BING_KEY` / `UNSPLASH_KEY`\n\n"
+        "4) For images, add local files to `assets/` or set `BING_KEY` / `UNSPLASH_KEY` in secrets\n\n"
         "5) Enable **Voice** or **Podcast** and choose voices in the sidebar"
     )
 
